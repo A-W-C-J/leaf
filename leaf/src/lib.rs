@@ -287,7 +287,9 @@ pub fn test_config(config_path: &str) -> Result<(), Error> {
         .map(|_| ())
         .map_err(Error::Config)
 }
-
+pub fn is_running(key: RuntimeId) -> bool {
+    RUNTIME_MANAGER.lock().unwrap().contains_key(&key)
+}
 fn new_runtime(opt: &RuntimeOption) -> Result<tokio::runtime::Runtime, Error> {
     match opt {
         RuntimeOption::SingleThread => tokio::runtime::Builder::new_current_thread()
