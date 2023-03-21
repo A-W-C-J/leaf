@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use futures::future::select_ok;
 use futures::stream::Stream;
 use futures::TryFutureExt;
+use futures::lock::Mutex;
 use log::*;
 use socket2::SockRef;
 use thiserror::Error;
@@ -137,7 +138,7 @@ async fn protect_socket(fd: RawFd) -> io::Result<()> {
         if stream.read_i32().await? != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("failed to protect outbound socket {}", fd),
+                format!("failed to protect outbound socket {}", socket.as_raw_fd()),
             ));
         }
     }
