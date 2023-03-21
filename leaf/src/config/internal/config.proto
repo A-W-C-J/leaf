@@ -1,6 +1,9 @@
-// Every time you make changes to this file, run `make proto-gen` to re-generate protobuf files.
-
 syntax = "proto3";
+
+message Api {
+	string address = 1;
+	uint32 port = 2;
+}
 
 message Dns {
 	message Ips {
@@ -13,9 +16,9 @@ message Dns {
 
 message Log {
 	enum Level {
-		INFO = 0;
-		TRACE = 1;
-		DEBUG = 2;
+		TRACE = 0;
+		DEBUG = 1;
+		INFO = 2;
 		WARN = 3;
 		ERROR = 4;
 	}
@@ -48,7 +51,7 @@ message ShadowsocksInboundSettings {
 }
 
 message TrojanInboundSettings {
-	repeated string passwords = 1;
+	string password = 3;
 }
 
 message WebSocketInboundSettings {
@@ -60,12 +63,6 @@ message AMuxInboundSettings {
 }
 
 message QuicInboundSettings {
-	string certificate = 1;
-	string certificate_key = 2;
-	repeated string alpn = 3;
-}
-
-message TlsInboundSettings {
 	string certificate = 1;
 	string certificate_key = 2;
 }
@@ -90,8 +87,6 @@ message RedirectOutboundSettings {
 message SocksOutboundSettings {
 	string address = 1;
 	uint32 port = 2;
-	string username = 3;
-	string password = 4;
 }
 
 message ShadowsocksOutboundSettings {
@@ -110,7 +105,6 @@ message TrojanOutboundSettings {
 message TlsOutboundSettings {
 	string server_name = 1;
 	repeated string alpn = 2;
-	string certificate = 3;
 }
 
 message WebSocketOutboundSettings {
@@ -123,9 +117,12 @@ message TryAllOutboundSettings {
 	uint32 delay_base = 2;
 }
 
-message StaticOutboundSettings {
+message RandomOutboundSettings {
 	repeated string actors = 1;
-	string method = 2;
+}
+
+message RROutboundSettings {
+	repeated string actors = 1;
 }
 
 message AMuxOutboundSettings {
@@ -141,33 +138,28 @@ message QuicOutboundSettings {
 	uint32 port = 2;
 	string server_name = 3;
 	string certificate = 4;
-	repeated string alpn = 5;
-}
-
-message VMessOutboundSettings {
-    string address = 1;
-    uint32 port = 2;
-    string uuid = 3;
-    string security = 4;
 }
 
 message ChainOutboundSettings {
 	repeated string actors = 1;
 }
 
+message RetryOutboundSettings {
+	repeated string actors = 1;
+	uint32 attempts = 2;
+}
+
 message FailOverOutboundSettings {
 	repeated string actors = 1;
 	uint32 fail_timeout = 2;
+	// if health check is disabled, it will always perform failover
+	// to other actors dispite whatever failover option is set.
 	bool health_check = 3;
 	uint32 check_interval = 4;
 	bool failover = 5;
 	bool fallback_cache = 6;
 	uint32 cache_size = 7;
 	uint32 cache_timeout = 8;
-	string last_resort = 9;
-	uint32 health_check_timeout = 10;
-	uint32 health_check_delay = 11;
-	uint32 health_check_active = 12;
 }
 
 message SelectOutboundSettings {
@@ -208,8 +200,6 @@ message Router {
 		repeated string ip_cidrs = 3;
 		repeated Mmdb mmdbs = 4;
 		repeated string port_ranges = 5;
-		repeated string networks = 6;
-		repeated string inbound_tags = 7;
 	}
 
 	repeated Rule rules = 1;
@@ -222,4 +212,5 @@ message Config {
 	repeated Outbound outbounds = 3;
 	Router router = 4;
 	Dns dns = 5;
+	Api api = 6;
 }

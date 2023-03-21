@@ -1,6 +1,7 @@
 use std::{
     collections::{hash_map, HashMap},
     convert::From,
+    sync::atomic::AtomicUsize,
     sync::Arc,
 };
 
@@ -10,12 +11,18 @@ use log::*;
 use protobuf::Message;
 use tokio::sync::RwLock;
 
+use crate::proxy::null;
+
 #[cfg(feature = "outbound-chain")]
 use crate::proxy::chain;
 #[cfg(feature = "outbound-failover")]
 use crate::proxy::failover;
-#[cfg(feature = "outbound-static")]
-use crate::proxy::r#static;
+#[cfg(feature = "outbound-random")]
+use crate::proxy::random;
+#[cfg(feature = "outbound-retry")]
+use crate::proxy::retry;
+#[cfg(feature = "outbound-rr")]
+use crate::proxy::rr;
 #[cfg(feature = "outbound-select")]
 use crate::proxy::select;
 #[cfg(feature = "outbound-tryall")]
@@ -47,43 +54,30 @@ use crate::proxy::ws;
 use crate::{
     app::SyncDnsClient,
     config::{self, Outbound},
-    proxy::{outbound::HandlerBuilder, *},
+    proxy::{self, outbound::HandlerBuilder, *},
 };
 
 use super::selector::OutboundSelector;
 
 pub struct OutboundManager {
     handlers: HashMap<String, AnyOutboundHandler>,
-    #[cfg(feature = "plugin")]
     external_handlers: super::plugin::ExternalHandlers,
     selectors: Arc<super::Selectors>,
     default_handler: Option<String>,
     abort_handles: Vec<AbortHandle>,
 }
 
-struct HandlerCacheEntry<'a> {
-    tag: &'a str,
-    handler: AnyOutboundHandler,
-    protocol: &'a str,
-    settings: &'a Vec<u8>,
-}
-
 impl OutboundManager {
     #[allow(clippy::type_complexity)]
     fn load_handlers(
-        outbounds: &Vec<Outbound>,
+        outbounds: &protobuf::RepeatedField<Outbound>,
         dns_client: SyncDnsClient,
         handlers: &mut HashMap<String, AnyOutboundHandler>,
-        #[cfg(feature = "plugin")] external_handlers: &mut super::plugin::ExternalHandlers,
+        external_handlers: &mut super::plugin::ExternalHandlers,
         default_handler: &mut Option<String>,
         abort_handles: &mut Vec<AbortHandle>,
     ) -> Result<()> {
-        // If there are multiple outbounds with the same setting, we would want
-        // a shared one to reduce memory usage. This vector is used as a cache for
-        // unseen outbounds so we can reuse them later.
-        let mut cached_handlers: Vec<HandlerCacheEntry> = Vec::new();
-
-        'loop1: for outbound in outbounds.iter() {
+        for outbound in outbounds.iter() {
             let tag = String::from(&outbound.tag);
             if handlers.contains_key(&tag) {
                 continue;
@@ -92,172 +86,193 @@ impl OutboundManager {
                 default_handler.replace(String::from(&outbound.tag));
                 debug!("default handler [{}]", &outbound.tag);
             }
-
-            // Check whether an identical one already exist.
-            for e in cached_handlers.iter() {
-                if e.protocol == &outbound.protocol && e.settings == &outbound.settings {
-                    trace!("add handler [{}] cloned from [{}]", &tag, &e.tag);
-                    handlers.insert(tag.clone(), e.handler.clone());
-                    continue 'loop1;
-                }
-            }
-
-            let h: AnyOutboundHandler = match outbound.protocol.as_str() {
+            match outbound.protocol.as_str() {
                 #[cfg(feature = "outbound-direct")]
-                "direct" => HandlerBuilder::default()
-                    .tag(tag.clone())
-                    .color(colored::Color::Green)
-                    .stream_handler(Box::new(direct::StreamHandler))
-                    .datagram_handler(Box::new(direct::DatagramHandler))
-                    .build(),
+                "direct" => {
+                    handlers.insert(
+                        tag.clone(),
+                        HandlerBuilder::default()
+                            .tag(tag.clone())
+                            .color(colored::Color::Green)
+                            .tcp_handler(Box::new(direct::TcpHandler))
+                            .udp_handler(Box::new(direct::UdpHandler))
+                            .build(),
+                    );
+                    trace!("added handler [{}]", &tag);
+                }
                 #[cfg(feature = "outbound-drop")]
-                "drop" => HandlerBuilder::default()
-                    .tag(tag.clone())
-                    .color(colored::Color::Red)
-                    .stream_handler(Box::new(drop::StreamHandler))
-                    .datagram_handler(Box::new(drop::DatagramHandler))
-                    .build(),
+                "drop" => {
+                    handlers.insert(
+                        tag.clone(),
+                        HandlerBuilder::default()
+                            .tag(tag.clone())
+                            .tcp_handler(Box::new(drop::TcpHandler))
+                            .udp_handler(Box::new(drop::UdpHandler))
+                            .build(),
+                    );
+                    trace!("added handler [{}]", &tag);
+                }
                 #[cfg(feature = "outbound-redirect")]
                 "redirect" => {
                     let settings =
                         config::RedirectOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let stream = Box::new(redirect::StreamHandler {
+                    let tcp = Box::new(redirect::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
                     });
-                    let datagram = Box::new(redirect::DatagramHandler {
+                    let udp = Box::new(redirect::UdpHandler {
                         address: settings.address,
                         port: settings.port as u16,
                     });
-                    HandlerBuilder::default()
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .datagram_handler(datagram)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
                 }
                 #[cfg(feature = "outbound-socks")]
                 "socks" => {
                     let settings =
                         config::SocksOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let stream = Box::new(socks::outbound::StreamHandler {
+                    let tcp = Box::new(socks::outbound::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
-                        username: settings.username.clone(),
-                        password: settings.password.clone(),
                     });
-                    let datagram = Box::new(socks::outbound::DatagramHandler {
+                    let udp = Box::new(socks::outbound::UdpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
                         dns_client: dns_client.clone(),
                     });
-                    HandlerBuilder::default()
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .datagram_handler(datagram)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
                 }
                 #[cfg(feature = "outbound-shadowsocks")]
                 "shadowsocks" => {
                     let settings =
                         config::ShadowsocksOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let stream = Box::new(shadowsocks::outbound::StreamHandler {
+                    let tcp = Box::new(shadowsocks::outbound::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
                         cipher: settings.method.clone(),
                         password: settings.password.clone(),
                     });
-                    let datagram = Box::new(shadowsocks::outbound::DatagramHandler {
+                    let udp = Box::new(shadowsocks::outbound::UdpHandler {
                         address: settings.address,
                         port: settings.port as u16,
                         cipher: settings.method,
                         password: settings.password,
                     });
-                    HandlerBuilder::default()
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .datagram_handler(datagram)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
                 }
                 #[cfg(feature = "outbound-trojan")]
                 "trojan" => {
                     let settings =
                         config::TrojanOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let stream = Box::new(trojan::outbound::StreamHandler {
+                    let tcp = Box::new(trojan::outbound::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
                         password: settings.password.clone(),
                     });
-                    let datagram = Box::new(trojan::outbound::DatagramHandler {
+                    let udp = Box::new(trojan::outbound::UdpHandler {
                         address: settings.address,
                         port: settings.port as u16,
                         password: settings.password,
                     });
-                    HandlerBuilder::default()
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .datagram_handler(datagram)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
                 }
                 #[cfg(feature = "outbound-vmess")]
                 "vmess" => {
                     let settings =
                         config::VMessOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let stream = Box::new(vmess::outbound::StreamHandler {
+                    let tcp = Box::new(vmess::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
                         uuid: settings.uuid.clone(),
                         security: settings.security.clone(),
                     });
-                    let datagram = Box::new(vmess::outbound::DatagramHandler {
+                    let udp = Box::new(vmess::UdpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
                         uuid: settings.uuid.clone(),
                         security: settings.security.clone(),
                     });
-                    HandlerBuilder::default()
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .datagram_handler(datagram)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
                 }
                 #[cfg(feature = "outbound-tls")]
                 "tls" => {
                     let settings =
                         config::TlsOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let certificate = if settings.certificate.is_empty() {
-                        None
-                    } else {
-                        Some(settings.certificate.clone())
-                    };
-                    let stream = Box::new(tls::outbound::StreamHandler::new(
+                    let mut alpns = Vec::new();
+                    for alpn in settings.alpn.iter() {
+                        alpns.push(alpn.clone());
+                    }
+                    let tcp = Box::new(tls::TcpHandler::new(
                         settings.server_name.clone(),
-                        settings.alpn.clone(),
-                        certificate,
-                    )?);
-                    HandlerBuilder::default()
+                        alpns.clone(),
+                    ));
+                    let udp = Box::new(null::outbound::UdpHandler {
+                        connect: None,
+                        transport_type: proxy::DatagramTransportType::Stream,
+                    });
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
                 }
                 #[cfg(feature = "outbound-ws")]
                 "ws" => {
                     let settings =
                         config::WebSocketOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let stream = Box::new(ws::outbound::StreamHandler {
+                    let tcp = Box::new(ws::outbound::TcpHandler {
                         path: settings.path.clone(),
                         headers: settings.headers.clone(),
                     });
-                    HandlerBuilder::default()
+                    let udp = Box::new(null::outbound::UdpHandler {
+                        connect: None,
+                        transport_type: proxy::DatagramTransportType::Stream,
+                    });
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
                 }
                 #[cfg(feature = "outbound-quic")]
                 "quic" => {
@@ -274,32 +289,50 @@ impl OutboundManager {
                     } else {
                         Some(settings.certificate.clone())
                     };
-                    let stream = Box::new(quic::outbound::StreamHandler::new(
+                    let tcp = Box::new(quic::outbound::TcpHandler::new(
                         settings.address.clone(),
                         settings.port as u16,
                         server_name,
-                        settings.alpn.clone(),
                         certificate,
                         dns_client.clone(),
                     ));
-                    HandlerBuilder::default()
+                    let udp = Box::new(null::outbound::UdpHandler {
+                        connect: Some(OutboundConnect::NoConnect),
+                        transport_type: DatagramTransportType::Stream,
+                    });
+                    let handler = HandlerBuilder::default()
                         .tag(tag.clone())
-                        .stream_handler(stream)
-                        .build()
+                        .tcp_handler(tcp)
+                        .udp_handler(udp)
+                        .build();
+                    handlers.insert(tag.clone(), handler);
+                    trace!("added handler [{}]", &tag);
+                }
+                #[cfg(feature = "outbound-h2")]
+                "h2" => {
+                    let settings =
+                        config::HTTP2OutboundSettings::parse_from_bytes(&outbound.settings)
+                            .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
+                    let tcp = Box::new(crate::proxy::h2::TcpHandler {
+                        path: settings.path.clone(),
+                        host: settings.host.clone(),
+                    });
+                    let handler = proxy::outbound::Handler::new(
+                        tag.clone(),
+                        colored::Color::TrueColor {
+                            r: 252,
+                            g: 107,
+                            b: 3,
+                        },
+                        Some(tcp),
+                        None,
+                    );
+                    trace!("add handler [{}]", &tag);
+                    handlers.insert(tag.clone(), handler);
                 }
                 _ => continue,
-            };
-            cached_handlers.push(HandlerCacheEntry {
-                tag: &outbound.tag,
-                handler: h.clone(),
-                protocol: &outbound.protocol,
-                settings: &outbound.settings,
-            });
-            trace!("add handler [{}]", &tag);
-            handlers.insert(tag, h);
+            }
         }
-
-        drop(cached_handlers);
 
         // FIXME a better way to find outbound deps?
         for _i in 0..8 {
@@ -327,20 +360,20 @@ impl OutboundManager {
                         if actors.is_empty() {
                             continue;
                         }
-                        let stream = Box::new(tryall::StreamHandler {
+                        let tcp = Box::new(tryall::TcpHandler {
                             actors: actors.clone(),
                             delay_base: settings.delay_base,
                             dns_client: dns_client.clone(),
                         });
-                        let datagram = Box::new(tryall::DatagramHandler {
+                        let udp = Box::new(tryall::UdpHandler {
                             actors,
                             delay_base: settings.delay_base,
                             dns_client: dns_client.clone(),
                         });
                         let handler = HandlerBuilder::default()
                             .tag(tag.clone())
-                            .stream_handler(stream)
-                            .datagram_handler(datagram)
+                            .tcp_handler(tcp)
+                            .udp_handler(udp)
                             .build();
                         handlers.insert(tag.clone(), handler);
                         trace!(
@@ -349,10 +382,10 @@ impl OutboundManager {
                             settings.actors.join(",")
                         );
                     }
-                    #[cfg(feature = "outbound-static")]
-                    "static" => {
+                    #[cfg(feature = "outbound-random")]
+                    "random" => {
                         let settings =
-                            config::StaticOutboundSettings::parse_from_bytes(&outbound.settings)
+                            config::RandomOutboundSettings::parse_from_bytes(&outbound.settings)
                                 .map_err(|e| {
                                     anyhow!("invalid [{}] outbound settings: {}", &tag, e)
                                 })?;
@@ -367,16 +400,58 @@ impl OutboundManager {
                         if actors.is_empty() {
                             continue;
                         }
-                        let stream = Box::new(r#static::StreamHandler::new(
-                            actors.clone(),
-                            &settings.method,
-                        )?);
-                        let datagram =
-                            Box::new(r#static::DatagramHandler::new(actors, &settings.method)?);
+                        let tcp = Box::new(random::TcpHandler {
+                            actors: actors.clone(),
+                            dns_client: dns_client.clone(),
+                        });
+                        let udp = Box::new(random::UdpHandler {
+                            actors,
+                            dns_client: dns_client.clone(),
+                        });
                         let handler = HandlerBuilder::default()
                             .tag(tag.clone())
-                            .stream_handler(stream)
-                            .datagram_handler(datagram)
+                            .tcp_handler(tcp)
+                            .udp_handler(udp)
+                            .build();
+                        handlers.insert(tag.clone(), handler);
+                        trace!(
+                            "added handler [{}] with actors: {}",
+                            &tag,
+                            settings.actors.join(",")
+                        );
+                    }
+                    #[cfg(feature = "outbound-rr")]
+                    "rr" => {
+                        let settings =
+                            config::RROutboundSettings::parse_from_bytes(&outbound.settings)
+                                .map_err(|e| {
+                                    anyhow!("invalid [{}] outbound settings: {}", &tag, e)
+                                })?;
+                        let mut actors = Vec::new();
+                        for actor in settings.actors.iter() {
+                            if let Some(a) = handlers.get(actor) {
+                                actors.push(a.clone());
+                            } else {
+                                continue 'outbounds;
+                            }
+                        }
+                        if actors.is_empty() {
+                            continue;
+                        }
+                        let tcp = Box::new(rr::TcpHandler {
+                            actors: actors.clone(),
+                            next: AtomicUsize::new(0),
+                            dns_client: dns_client.clone(),
+                        });
+                        let udp = Box::new(rr::UdpHandler {
+                            actors,
+                            next: AtomicUsize::new(0),
+                            dns_client: dns_client.clone(),
+                        });
+                        let handler = HandlerBuilder::default()
+                            .tag(tag.clone())
+                            .tcp_handler(tcp)
+                            .udp_handler(udp)
                             .build();
                         handlers.insert(tag.clone(), handler);
                         trace!(
@@ -403,16 +478,7 @@ impl OutboundManager {
                         if actors.is_empty() {
                             continue;
                         }
-                        let last_resort = if settings.last_resort.is_empty() {
-                            None
-                        } else {
-                            if let Some(a) = handlers.get(&settings.last_resort) {
-                                Some(a.clone())
-                            } else {
-                                continue 'outbounds;
-                            }
-                        };
-                        let (stream, mut stream_abort_handles) = failover::StreamHandler::new(
+                        let (tcp, mut tcp_abort_handles) = failover::TcpHandler::new(
                             actors.clone(),
                             settings.fail_timeout,
                             settings.health_check,
@@ -421,32 +487,24 @@ impl OutboundManager {
                             settings.fallback_cache,
                             settings.cache_size as usize,
                             settings.cache_timeout as u64,
-                            last_resort.clone(),
-                            settings.health_check_timeout,
-                            settings.health_check_delay,
-                            settings.health_check_active,
                             dns_client.clone(),
                         );
-                        let (datagram, mut datagram_abort_handles) = failover::DatagramHandler::new(
+                        let (udp, mut udp_abort_handles) = failover::UdpHandler::new(
                             actors,
                             settings.fail_timeout,
                             settings.health_check,
                             settings.check_interval,
                             settings.failover,
-                            last_resort,
-                            settings.health_check_timeout,
-                            settings.health_check_delay,
-                            settings.health_check_active,
                             dns_client.clone(),
                         );
                         let handler = HandlerBuilder::default()
                             .tag(tag.clone())
-                            .stream_handler(Box::new(stream))
-                            .datagram_handler(Box::new(datagram))
+                            .tcp_handler(Box::new(tcp))
+                            .udp_handler(Box::new(udp))
                             .build();
                         handlers.insert(tag.clone(), handler);
-                        abort_handles.append(&mut stream_abort_handles);
-                        abort_handles.append(&mut datagram_abort_handles);
+                        abort_handles.append(&mut tcp_abort_handles);
+                        abort_handles.append(&mut udp_abort_handles);
                         trace!(
                             "added handler [{}] with actors: {}",
                             &tag,
@@ -468,7 +526,7 @@ impl OutboundManager {
                                 continue 'outbounds;
                             }
                         }
-                        let (stream, mut stream_abort_handles) = amux::outbound::StreamHandler::new(
+                        let (tcp, mut tcp_abort_handles) = amux::outbound::TcpHandler::new(
                             settings.address.clone(),
                             settings.port as u16,
                             actors.clone(),
@@ -476,12 +534,17 @@ impl OutboundManager {
                             settings.concurrency as usize,
                             dns_client.clone(),
                         );
+                        let udp = Box::new(null::outbound::UdpHandler {
+                            connect: Some(OutboundConnect::NoConnect),
+                            transport_type: DatagramTransportType::Stream,
+                        });
                         let handler = HandlerBuilder::default()
                             .tag(tag.clone())
-                            .stream_handler(Box::new(stream))
+                            .tcp_handler(Box::new(tcp))
+                            .udp_handler(udp)
                             .build();
                         handlers.insert(tag.clone(), handler);
-                        abort_handles.append(&mut stream_abort_handles);
+                        abort_handles.append(&mut tcp_abort_handles);
                         trace!(
                             "added handler [{}] with actors: {}",
                             &tag,
@@ -506,16 +569,16 @@ impl OutboundManager {
                         if actors.is_empty() {
                             continue;
                         }
-                        let stream = Box::new(chain::outbound::StreamHandler {
+                        let tcp = Box::new(chain::outbound::TcpHandler {
                             actors: actors.clone(),
                         });
-                        let datagram = Box::new(chain::outbound::DatagramHandler {
+                        let udp = Box::new(chain::outbound::UdpHandler {
                             actors: actors.clone(),
                         });
                         let handler = HandlerBuilder::default()
                             .tag(tag.clone())
-                            .stream_handler(stream)
-                            .datagram_handler(datagram)
+                            .tcp_handler(tcp)
+                            .udp_handler(udp)
                             .build();
                         handlers.insert(tag.clone(), handler);
                         trace!(
@@ -524,62 +587,10 @@ impl OutboundManager {
                             settings.actors.join(",")
                         );
                     }
-                    #[cfg(feature = "plugin")]
-                    "plugin" => {
+                    #[cfg(feature = "outbound-retry")]
+                    "retry" => {
                         let settings =
-                            config::PluginOutboundSettings::parse_from_bytes(&outbound.settings)
-                                .map_err(|e| {
-                                    anyhow!("invalid [{}] outbound settings: {}", &tag, e)
-                                })?;
-                        unsafe {
-                            external_handlers
-                                .new_handler(settings.path, &tag, &settings.args)
-                                .unwrap()
-                        };
-                        let stream = Box::new(super::plugin::ExternalOutboundStreamHandlerProxy(
-                            external_handlers.get_stream_handler(&tag).unwrap(),
-                        ));
-                        let datagram =
-                            Box::new(super::plugin::ExternalOutboundDatagramHandlerProxy(
-                                external_handlers.get_datagram_handler(&tag).unwrap(),
-                            ));
-                        let handler = HandlerBuilder::default()
-                            .tag(tag.clone())
-                            .stream_handler(stream)
-                            .datagram_handler(datagram)
-                            .build();
-                        handlers.insert(tag.clone(), handler);
-                        trace!("added handler [{}]", &tag,);
-                    }
-                    _ => continue,
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[allow(unused_variables)]
-    fn load_selectors(
-        outbounds: &Vec<Outbound>,
-        handlers: &mut HashMap<String, AnyOutboundHandler>,
-        #[cfg(feature = "plugin")] external_handlers: &mut super::plugin::ExternalHandlers,
-        selectors: &mut super::Selectors,
-    ) -> Result<()> {
-        // FIXME a better way to find outbound deps?
-        for _i in 0..8 {
-            #[allow(unused_labels)]
-            'outbounds: for outbound in outbounds.iter() {
-                let tag = String::from(&outbound.tag);
-                if handlers.contains_key(&tag) || selectors.contains_key(&tag) {
-                    continue;
-                }
-                #[allow(clippy::single_match)]
-                match outbound.protocol.as_str() {
-                    #[cfg(feature = "outbound-select")]
-                    "select" => {
-                        let settings =
-                            config::SelectOutboundSettings::parse_from_bytes(&outbound.settings)
+                            config::RetryOutboundSettings::parse_from_bytes(&outbound.settings)
                                 .map_err(|e| {
                                     anyhow!("invalid [{}] outbound settings: {}", &tag, e)
                                 })?;
@@ -594,15 +605,96 @@ impl OutboundManager {
                         if actors.is_empty() {
                             continue;
                         }
+                        let tcp = Box::new(retry::TcpHandler {
+                            actors: actors.clone(),
+                            attempts: settings.attempts as usize,
+                            dns_client: dns_client.clone(),
+                        });
+                        let udp = Box::new(retry::UdpHandler {
+                            actors,
+                            attempts: settings.attempts as usize,
+                            dns_client: dns_client.clone(),
+                        });
+                        let handler = HandlerBuilder::default()
+                            .tag(tag.clone())
+                            .tcp_handler(tcp)
+                            .udp_handler(udp)
+                            .build();
+                        handlers.insert(tag.clone(), handler);
+                        trace!(
+                            "added handler [{}] with actors: {}",
+                            &tag,
+                            settings.actors.join(",")
+                        );
+                    }
+                    "plugin" => {
+                        let settings =
+                            config::PluginOutboundSettings::parse_from_bytes(&outbound.settings)
+                                .map_err(|e| {
+                                    anyhow!("invalid [{}] outbound settings: {}", &tag, e)
+                                })?;
+                        unsafe {
+                            external_handlers
+                                .new_handler(settings.path, &tag, &settings.args)
+                                .unwrap()
+                        };
+                        let tcp = Box::new(super::plugin::ExternalTcpOutboundHandlerProxy(
+                            external_handlers.get_tcp_handler(&tag).unwrap(),
+                        ));
+                        let udp = Box::new(super::plugin::ExternalUdpOutboundHandlerProxy(
+                            external_handlers.get_udp_handler(&tag).unwrap(),
+                        ));
+                        let handler = HandlerBuilder::default()
+                            .tag(tag.clone())
+                            .tcp_handler(tcp)
+                            .udp_handler(udp)
+                            .build();
+                        handlers.insert(tag.clone(), handler);
+                        trace!("added handler [{}]", &tag,);
+                    }
+                    _ => continue,
+                }
+            }
+        }
 
-                        let actors_tags: Vec<String> =
-                            actors.iter().map(|x| x.tag().to_owned()).collect();
+        Ok(())
+    }
 
-                        use std::sync::atomic::AtomicUsize;
-                        let selected = Arc::new(AtomicUsize::new(0));
+    fn load_selectors(
+        outbounds: &protobuf::RepeatedField<Outbound>,
+        handlers: &mut HashMap<String, AnyOutboundHandler>,
+        external_handlers: &mut super::plugin::ExternalHandlers,
+        selectors: &mut super::Selectors,
+    ) -> Result<()> {
+        // FIXME a better way to find outbound deps?
+        for _i in 0..8 {
+            'outbounds: for outbound in outbounds.iter() {
+                let tag = String::from(&outbound.tag);
+                if handlers.contains_key(&tag) || selectors.contains_key(&tag) {
+                    continue;
+                }
+                #[allow(clippy::single_match)]
+                match outbound.protocol.as_str() {
+                    #[cfg(feature = "outbound-select")]
+                    "select" => {
+                        let settings =
+                            config::SelectOutboundSettings::parse_from_bytes(&outbound.settings)
+                                .map_err(|e| {
+                                    anyhow!("invalid [{}] outbound settings: {}", &tag, e)
+                                })?;
+                        let mut actors = HashMap::new();
+                        for actor in settings.actors.iter() {
+                            if let Some(a) = handlers.get(actor) {
+                                actors.insert(actor.to_owned(), a.clone());
+                            } else {
+                                continue 'outbounds;
+                            }
+                        }
+                        if actors.is_empty() {
+                            continue;
+                        }
 
-                        let mut selector =
-                            OutboundSelector::new(tag.clone(), actors_tags, selected.clone());
+                        let mut selector = OutboundSelector::new(tag.clone(), actors);
                         if let Ok(Some(selected)) = super::selector::get_selected_from_cache(&tag) {
                             // FIXME handle error
                             let _ = selector.set_selected(&selected);
@@ -611,16 +703,17 @@ impl OutboundManager {
                         }
                         let selector = Arc::new(RwLock::new(selector));
 
-                        let stream = Box::new(select::StreamHandler {
-                            actors: actors.clone(),
-                            selected: selected.clone(),
+                        let tcp = Box::new(select::TcpHandler {
+                            selector: selector.clone(),
                         });
-                        let datagram = Box::new(select::DatagramHandler { actors, selected });
+                        let udp = Box::new(select::UdpHandler {
+                            selector: selector.clone(),
+                        });
                         selectors.insert(tag.clone(), selector);
                         let handler = HandlerBuilder::default()
                             .tag(tag.clone())
-                            .stream_handler(stream)
-                            .datagram_handler(datagram)
+                            .tcp_handler(tcp)
+                            .udp_handler(udp)
                             .build();
                         handlers.insert(tag.clone(), handler);
                         trace!(
@@ -640,7 +733,7 @@ impl OutboundManager {
     // TODO make this non-async?
     pub async fn reload(
         &mut self,
-        outbounds: &Vec<Outbound>,
+        outbounds: &protobuf::RepeatedField<Outbound>,
         dns_client: SyncDnsClient,
     ) -> Result<()> {
         // Save outound select states.
@@ -652,7 +745,6 @@ impl OutboundManager {
         // Load new outbounds.
         let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
 
-        #[cfg(feature = "plugin")]
         let mut external_handlers = super::plugin::ExternalHandlers::new();
         let mut default_handler: Option<String> = None;
         let mut abort_handles: Vec<AbortHandle> = Vec::new();
@@ -662,7 +754,6 @@ impl OutboundManager {
                 outbounds,
                 dns_client.clone(),
                 &mut handlers,
-                #[cfg(feature = "plugin")]
                 &mut external_handlers,
                 &mut default_handler,
                 &mut abort_handles,
@@ -670,7 +761,6 @@ impl OutboundManager {
             Self::load_selectors(
                 outbounds,
                 &mut handlers,
-                #[cfg(feature = "plugin")]
                 &mut external_handlers,
                 &mut selectors,
             )?;
@@ -680,7 +770,9 @@ impl OutboundManager {
         for (k, v) in selected_outbounds.iter() {
             for (k2, v2) in selectors.iter_mut() {
                 if k == k2 {
-                    let _ = v2.write().await.set_selected(v);
+                    if let Some(v) = v {
+                        let _ = v2.write().await.set_selected(v);
+                    }
                 }
             }
         }
@@ -691,19 +783,18 @@ impl OutboundManager {
         }
 
         self.handlers = handlers;
-        #[cfg(feature = "plugin")]
-        {
-            self.external_handlers = external_handlers;
-        }
+        self.external_handlers = external_handlers;
         self.selectors = Arc::new(selectors);
         self.default_handler = default_handler;
         self.abort_handles = abort_handles;
         Ok(())
     }
 
-    pub fn new(outbounds: &Vec<Outbound>, dns_client: SyncDnsClient) -> Result<Self> {
+    pub fn new(
+        outbounds: &protobuf::RepeatedField<Outbound>,
+        dns_client: SyncDnsClient,
+    ) -> Result<Self> {
         let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
-        #[cfg(feature = "plugin")]
         let mut external_handlers = super::plugin::ExternalHandlers::new();
         let mut default_handler: Option<String> = None;
         let mut abort_handles: Vec<AbortHandle> = Vec::new();
@@ -713,7 +804,6 @@ impl OutboundManager {
                 outbounds,
                 dns_client.clone(),
                 &mut handlers,
-                #[cfg(feature = "plugin")]
                 &mut external_handlers,
                 &mut default_handler,
                 &mut abort_handles,
@@ -721,14 +811,12 @@ impl OutboundManager {
             Self::load_selectors(
                 outbounds,
                 &mut handlers,
-                #[cfg(feature = "plugin")]
                 &mut external_handlers,
                 &mut selectors,
             )?;
         }
         Ok(OutboundManager {
             handlers,
-            #[cfg(feature = "plugin")]
             external_handlers,
             selectors: Arc::new(selectors),
             default_handler,

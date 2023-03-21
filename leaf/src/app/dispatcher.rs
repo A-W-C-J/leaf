@@ -3,21 +3,19 @@ use std::io::{self, ErrorKind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_recursion::async_recursion;
+use futures::future::{self, Either};
 use log::*;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 
 use crate::{
     app::SyncDnsClient,
-    common::{self, sniff},
+    common::sniff,
     option,
-    proxy::*,
-    session::*,
+    proxy::{OutboundDatagram, ProxyStream, TcpOutboundHandler, UdpOutboundHandler},
+    session::{Network, Session, SocksAddr},
 };
-
-#[cfg(feature = "stat")]
-use crate::app::SyncStatManager;
 
 use super::outbound::manager::OutboundManager;
 use super::router::Router;
@@ -26,28 +24,27 @@ use super::router::Router;
 fn log_request(
     sess: &Session,
     outbound_tag: &str,
-    outbound_tag_color: &colored::Color,
-    handshake_time: Option<u128>,
+    outbound_tag_color: Option<colored::Color>,
+    handshake_time: u128,
 ) {
-    let hs = handshake_time.map_or("failed".to_string(), |hs| format!("{}ms", hs));
-    if !*crate::option::LOG_NO_COLOR {
+    if let Some(color) = outbound_tag_color {
         use colored::Colorize;
         let network_color = match sess.network {
             Network::Tcp => colored::Color::Blue,
             Network::Udp => colored::Color::Yellow,
         };
         info!(
-            "[{}] [{}] [{}] [{}] {}",
+            "[{}] [{}] [{}] [{}ms] {}",
             &sess.inbound_tag,
             sess.network.to_string().color(network_color),
-            outbound_tag.color(*outbound_tag_color),
-            hs,
+            outbound_tag.color(color),
+            handshake_time,
             &sess.destination,
         );
     } else {
         info!(
-            "[{}] [{}] [{}] [{}] {}",
-            sess.network, &sess.inbound_tag, outbound_tag, hs, &sess.destination,
+            "[{}] [{}] [{}] [{}ms] {}",
+            sess.network, &sess.inbound_tag, outbound_tag, handshake_time, &sess.destination,
         );
     }
 }
@@ -56,8 +53,6 @@ pub struct Dispatcher {
     outbound_manager: Arc<RwLock<OutboundManager>>,
     router: Arc<RwLock<Router>>,
     dns_client: SyncDnsClient,
-    #[cfg(feature = "stat")]
-    stat_manager: SyncStatManager,
 }
 
 impl Dispatcher {
@@ -65,62 +60,59 @@ impl Dispatcher {
         outbound_manager: Arc<RwLock<OutboundManager>>,
         router: Arc<RwLock<Router>>,
         dns_client: SyncDnsClient,
-        #[cfg(feature = "stat")] stat_manager: SyncStatManager,
     ) -> Self {
         Dispatcher {
             outbound_manager,
             router,
             dns_client,
-            #[cfg(feature = "stat")]
-            stat_manager,
         }
     }
 
-    pub async fn dispatch_stream<T>(&self, mut sess: Session, lhs: T)
+    pub async fn dispatch_tcp<T>(&self, sess: &mut Session, lhs: T)
     where
         T: 'static + AsyncRead + AsyncWrite + Unpin + Send + Sync,
     {
-        let mut lhs: Box<dyn ProxyStream> = if *option::DOMAIN_SNIFFING
-            && !sess.destination.is_domain()
-            && sess.destination.port() == 443
-        {
-            let mut lhs = sniff::SniffingStream::new(lhs);
-            match lhs.sniff().await {
-                Ok(res) => {
-                    if let Some(domain) = res {
-                        debug!(
-                            "sniffed domain {} for tcp link {} <-> {}",
-                            &domain, &sess.source, &sess.destination,
+        let mut lhs: Box<dyn ProxyStream> =
+            if !sess.destination.is_domain() && sess.destination.port() == 443 {
+                let mut lhs = sniff::SniffingStream::new(lhs);
+                match lhs.sniff().await {
+                    Ok(res) => {
+                        if let Some(domain) = res {
+                            debug!(
+                                "sniffed domain {} for tcp link {} <-> {}",
+                                &domain, &sess.source, &sess.destination,
+                            );
+                            sess.destination =
+                                match SocksAddr::try_from((&domain, sess.destination.port())) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        debug!(
+                                            "convert sniffed domain {} to destination failed: {}",
+                                            &domain, e,
+                                        );
+                                        return;
+                                    }
+                                };
+                        }
+                    }
+                    Err(e) => {
+                        trace!(
+                            "sniff tcp uplink {} -> {} failed: {}",
+                            &sess.source,
+                            &sess.destination,
+                            e,
                         );
-                        sess.destination =
-                            match SocksAddr::try_from((&domain, sess.destination.port())) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    warn!(
-                                        "convert sniffed domain {} to destination failed: {}",
-                                        &domain, e,
-                                    );
-                                    return;
-                                }
-                            };
+                        return;
                     }
                 }
-                Err(e) => {
-                    debug!(
-                        "sniff tcp uplink {} -> {} failed: {}",
-                        &sess.source, &sess.destination, e,
-                    );
-                    return;
-                }
-            }
-            Box::new(lhs)
-        } else {
-            Box::new(lhs)
-        };
+                Box::new(lhs)
+            } else {
+                Box::new(lhs)
+            };
 
         let outbound = {
             let router = self.router.read().await;
-            match router.pick_route(&sess).await {
+            let outbound = match router.pick_route(sess).await {
                 Ok(tag) => {
                     debug!(
                         "picked route [{}] for {} -> {}",
@@ -138,25 +130,36 @@ impl Dispatcher {
                         tag
                     } else {
                         warn!("can not find any handlers");
+                        if let Err(e) = lhs.shutdown().await {
+                            debug!(
+                                "tcp downlink {} <- {} error: {}",
+                                &sess.source, &sess.destination, e,
+                            );
+                        }
                         return;
                     }
                 }
-            }
+            };
+            outbound
         };
-
-        sess.outbound_tag = outbound.clone();
 
         let h = if let Some(h) = self.outbound_manager.read().await.get(&outbound) {
             h
         } else {
             // FIXME use  the default handler
-            warn!("handler not found");
+            debug!("handler not found");
+            if let Err(e) = lhs.shutdown().await {
+                debug!(
+                    "tcp downlink {} <- {} error: {}",
+                    &sess.source, &sess.destination, e,
+                );
+            }
             return;
         };
 
         let handshake_start = tokio::time::Instant::now();
         let stream =
-            match crate::proxy::connect_stream_outbound(&sess, self.dns_client.clone(), &h).await {
+            match crate::proxy::connect_tcp_outbound(sess, self.dns_client.clone(), &h).await {
                 Ok(s) => s,
                 Err(e) => {
                     debug!(
@@ -166,66 +169,255 @@ impl Dispatcher {
                         &h.tag(),
                         e
                     );
-                    log_request(&sess, h.tag(), h.color(), None);
                     return;
                 }
             };
-        let th = match h.stream() {
-            Ok(th) => th,
-            Err(e) => {
-                log::warn!(
-                    "dispatch tcp {} -> {} to [{}] failed: {}",
-                    &sess.source,
-                    &sess.destination,
-                    &h.tag(),
-                    e
-                );
-                return;
-            }
-        };
-        match th.handle(&sess, stream).await {
-            Ok(mut rhs) => {
+        match TcpOutboundHandler::handle(h.as_ref(), sess, stream).await {
+            Ok(rhs) => {
                 let elapsed = tokio::time::Instant::now().duration_since(handshake_start);
 
-                log_request(&sess, h.tag(), h.color(), Some(elapsed.as_millis()));
-
-                #[cfg(feature = "stat")]
-                if *crate::option::ENABLE_STATS {
-                    rhs = self
-                        .stat_manager
-                        .write()
-                        .await
-                        .stat_stream(rhs, sess.clone());
+                if *crate::option::LOG_NO_COLOR {
+                    log_request(sess, h.tag(), None, elapsed.as_millis());
+                } else {
+                    log_request(sess, h.tag(), Some(h.color()), elapsed.as_millis());
                 }
 
-                match common::io::copy_buf_bidirectional_with_timeout(
-                    &mut lhs,
-                    &mut rhs,
-                    *option::LINK_BUFFER_SIZE * 1024,
-                    Duration::from_secs(*option::TCP_UPLINK_TIMEOUT),
-                    Duration::from_secs(*option::TCP_DOWNLINK_TIMEOUT),
-                )
-                .await
-                {
-                    Ok((up_count, down_count)) => {
-                        debug!(
-                            "tcp link {} <-> {} done, ({}, {}) bytes transfered [{}]",
+                let (lr, mut lw) = tokio::io::split(lhs);
+                let (rr, mut rw) = tokio::io::split(rhs);
+
+                let mut lr = BufReader::with_capacity(*option::LINK_BUFFER_SIZE * 1024, lr);
+                let mut rr = BufReader::with_capacity(*option::LINK_BUFFER_SIZE * 1024, rr);
+
+                let l2r = Box::pin(tokio::io::copy_buf(&mut lr, &mut rw));
+                let r2l = Box::pin(tokio::io::copy_buf(&mut rr, &mut lw));
+
+                // TODO Propagate EOF signal.
+
+                // Drives both uplink and downlink to completion, i.e. read till EOF.
+                match future::select(l2r, r2l).await {
+                    // Uplink task returns first, with the result of the completed uplink
+                    // task and the uncompleted downlink task.
+                    Either::Left((up_res, new_r2l)) => {
+                        // Logs the uplink result, either successful with bytes transfered
+                        // or an error.
+                        match up_res {
+                            Ok(up_n) => {
+                                debug!(
+                                    "tcp uplink {} -> {} done, {} bytes transfered [{}]",
+                                    &sess.source,
+                                    &sess.destination,
+                                    up_n,
+                                    &h.tag(),
+                                );
+                            }
+                            Err(up_e) => {
+                                // FIXME Perhaps we should terminate the pipe immediately.
+                                debug!(
+                                    "tcp uplink {} -> {} error: {} [{}]",
+                                    &sess.source,
+                                    &sess.destination,
+                                    up_e,
+                                    &h.tag()
+                                );
+                            }
+                        }
+
+                        // Puts a timeout limit on the uncompleted downlink task, because uplink
+                        // has been completed, and we don't like half-closed connections, the other
+                        // half must complete before timeout.
+                        let timed_r2l =
+                            timeout(Duration::from_secs(*option::TCP_DOWNLINK_TIMEOUT), new_r2l);
+
+                        trace!(
+                            "applied {}s downlink timeout to {} <- {}",
+                            *option::TCP_DOWNLINK_TIMEOUT,
                             &sess.source,
-                            &sess.destination,
-                            up_count,
-                            down_count,
-                            &h.tag(),
+                            &sess.destination
                         );
+
+                        // Because uplink has been completed, no furture data from the inbound
+                        // connection, we would like to close the write side of the outbound
+                        // connection, so that notifies the close of the pipeline.
+                        //
+                        // TODO Perhaps we should not send FIN in order to compatible with some
+                        // of the improperly implemented server programs, e.g. a server closes
+                        // the write side after reading EOF on read side.
+                        // let rw_shutdown = rw.shutdown();
+
+                        // Drives both the above tasks to completion simultaneously and get the
+                        // results.
+                        // let (shutdown_res, timed_r2l_res) =
+                        //     future::join(rw_shutdown, timed_r2l).await;
+
+                        let timed_r2l_res = timed_r2l.await;
+
+                        // Logs the shutdown result.
+                        // if let Err(e) = shutdown_res {
+                        //     debug!(
+                        //         "tcp uplink {} -> {} error: {} [{}]",
+                        //         &sess.source,
+                        //         &sess.destination,
+                        //         e,
+                        //         &h.tag()
+                        //     );
+                        // }
+
+                        // Logs the downlink result.
+                        match timed_r2l_res {
+                            Ok(down_res) => match down_res {
+                                Ok(down_n) => {
+                                    debug!(
+                                        "tcp downlink {} <- {} done, {} bytes transfered [{}]",
+                                        &sess.source,
+                                        &sess.destination,
+                                        down_n,
+                                        &h.tag(),
+                                    );
+                                }
+                                Err(down_e) => {
+                                    debug!(
+                                        "tcp downlink {} <- {} error: {} [{}]",
+                                        &sess.source,
+                                        &sess.destination,
+                                        down_e,
+                                        &h.tag()
+                                    );
+                                }
+                            },
+                            Err(timeout_e) => {
+                                debug!(
+                                    "tcp downlink {} <- {} timeout: {} [{}]",
+                                    &sess.source,
+                                    &sess.destination,
+                                    timeout_e,
+                                    &h.tag()
+                                );
+                            }
+                        }
+
+                        // Finally shuts down the inbound connection.
+                        // if let Err(e) = lw.shutdown().await {
+                        //     debug!(
+                        //         "tcp downlink {} <- {} error: {} [{}]",
+                        //         &sess.source,
+                        //         &sess.destination,
+                        //         e,
+                        //         &h.tag()
+                        //     );
+                        // }
                     }
-                    Err(e) => {
-                        debug!(
-                            "tcp link {} <-> {} error: {} [{}]",
+
+                    // In case downlink returns first, the process is similar to the other
+                    // side described above, with the roles of uplink and downlink interchanged.
+                    Either::Right((down_res, new_l2r)) => {
+                        match down_res {
+                            Ok(down_n) => {
+                                debug!(
+                                    "tcp downlink {} <- {} done, {} bytes transfered [{}]",
+                                    &sess.source,
+                                    &sess.destination,
+                                    down_n,
+                                    &h.tag(),
+                                );
+                            }
+                            Err(down_e) => {
+                                debug!(
+                                    "tcp downlink {} <- {} error: {} [{}]",
+                                    &sess.source,
+                                    &sess.destination,
+                                    down_e,
+                                    &h.tag()
+                                );
+                            }
+                        }
+
+                        let timed_l2r =
+                            timeout(Duration::from_secs(*option::TCP_UPLINK_TIMEOUT), new_l2r);
+
+                        trace!(
+                            "applied {}s uplink timeout to {} -> {}",
+                            *option::TCP_UPLINK_TIMEOUT,
                             &sess.source,
-                            &sess.destination,
-                            e,
-                            &h.tag()
+                            &sess.destination
                         );
+
+                        // let (shutdown_res, timed_l2r_res) =
+                        //     future::join(lw.shutdown(), timed_l2r).await;
+
+                        let timed_l2r_res = timed_l2r.await;
+
+                        // if let Err(e) = shutdown_res {
+                        //     debug!(
+                        //         "tcp downlink {} <- {} error: {} [{}]",
+                        //         &sess.source,
+                        //         &sess.destination,
+                        //         e,
+                        //         &h.tag()
+                        //     );
+                        // }
+
+                        match timed_l2r_res {
+                            Ok(up_res) => match up_res {
+                                Ok(up_n) => {
+                                    debug!(
+                                        "tcp uplink {} -> {} done, {} bytes transfered [{}]",
+                                        &sess.source,
+                                        &sess.destination,
+                                        up_n,
+                                        &h.tag(),
+                                    );
+                                }
+                                Err(up_e) => {
+                                    debug!(
+                                        "tcp uplink {} -> {} error: {} [{}]",
+                                        &sess.source,
+                                        &sess.destination,
+                                        up_e,
+                                        &h.tag()
+                                    );
+                                }
+                            },
+                            Err(timeout_e) => {
+                                debug!(
+                                    "tcp uplink {} -> {} timeout: {} [{}]",
+                                    &sess.source,
+                                    &sess.destination,
+                                    timeout_e,
+                                    &h.tag()
+                                );
+                            }
+                        }
+
+                        // if let Err(e) = rw.shutdown().await {
+                        //     debug!(
+                        //         "tcp uplink {} -> {} error: {} [{}]",
+                        //         &sess.source,
+                        //         &sess.destination,
+                        //         e,
+                        //         &h.tag()
+                        //     );
+                        // }
                     }
+                }
+
+                if let Err(e) = rw.shutdown().await {
+                    debug!(
+                        "tcp uplink {} -> {} error: {} [{}]",
+                        &sess.source,
+                        &sess.destination,
+                        e,
+                        &h.tag()
+                    );
+                }
+
+                if let Err(e) = lw.shutdown().await {
+                    debug!(
+                        "tcp downlink {} <- {} error: {} [{}]",
+                        &sess.source,
+                        &sess.destination,
+                        e,
+                        &h.tag()
+                    );
                 }
             }
             Err(e) => {
@@ -236,19 +428,24 @@ impl Dispatcher {
                     &h.tag(),
                     e
                 );
-                log_request(&sess, h.tag(), h.color(), None);
+
+                if let Err(e) = lhs.shutdown().await {
+                    debug!(
+                        "tcp downlink {} <- {} error: {} [{}]",
+                        &sess.source,
+                        &sess.destination,
+                        e,
+                        &h.tag()
+                    );
+                }
             }
         }
     }
 
-    #[async_recursion]
-    pub async fn dispatch_datagram(
-        &self,
-        mut sess: Session,
-    ) -> io::Result<Box<dyn OutboundDatagram>> {
+    pub async fn dispatch_udp(&self, sess: &Session) -> io::Result<Box<dyn OutboundDatagram>> {
         let outbound = {
             let router = self.router.read().await;
-            match router.pick_route(&sess).await {
+            let outbound = match router.pick_route(sess).await {
                 Ok(tag) => {
                     debug!(
                         "picked route [{}] for {} -> {}",
@@ -265,42 +462,33 @@ impl Dispatcher {
                         );
                         tag
                     } else {
-                        warn!("no handler found");
                         return Err(io::Error::new(ErrorKind::Other, "no available handler"));
                     }
                 }
-            }
+            };
+            outbound
         };
-
-        sess.outbound_tag = outbound.clone();
 
         let h = if let Some(h) = self.outbound_manager.read().await.get(&outbound) {
             h
         } else {
-            warn!("handler not found");
             return Err(io::Error::new(ErrorKind::Other, "handler not found"));
         };
 
         let handshake_start = tokio::time::Instant::now();
         let transport =
-            crate::proxy::connect_datagram_outbound(&sess, self.dns_client.clone(), &h).await?;
-        match h.datagram()?.handle(&sess, transport).await {
-            #[allow(unused_mut)]
-            Ok(mut d) => {
+            crate::proxy::connect_udp_outbound(sess, self.dns_client.clone(), &h).await?;
+        match UdpOutboundHandler::handle(h.as_ref(), sess, transport).await {
+            Ok(c) => {
                 let elapsed = tokio::time::Instant::now().duration_since(handshake_start);
 
-                log_request(&sess, h.tag(), h.color(), Some(elapsed.as_millis()));
-
-                #[cfg(feature = "stat")]
-                if *crate::option::ENABLE_STATS {
-                    d = self
-                        .stat_manager
-                        .write()
-                        .await
-                        .stat_outbound_datagram(d, sess.clone());
+                if *crate::option::LOG_NO_COLOR {
+                    log_request(sess, h.tag(), None, elapsed.as_millis());
+                } else {
+                    log_request(sess, h.tag(), Some(h.color()), elapsed.as_millis());
                 }
 
-                Ok(d)
+                Ok(c)
             }
             Err(e) => {
                 debug!(
@@ -310,7 +498,6 @@ impl Dispatcher {
                     &h.tag(),
                     e
                 );
-                log_request(&sess, h.tag(), h.color(), None);
                 Err(e)
             }
         }

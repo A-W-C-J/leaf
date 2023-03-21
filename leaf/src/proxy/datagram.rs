@@ -1,8 +1,4 @@
-use std::{
-    io,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
 use futures::TryFutureExt;
@@ -13,60 +9,10 @@ use crate::{
     session::{DatagramSource, SocksAddr},
 };
 
-use super::*;
-
-/// An outbound datagram wraps a normal UDP socket and used as a normal UDP socket.
-pub struct StdOutboundDatagram {
-    inner: UdpSocket,
-}
-
-impl StdOutboundDatagram {
-    pub fn new(inner: UdpSocket) -> Self {
-        Self { inner }
-    }
-}
-
-impl OutboundDatagram for StdOutboundDatagram {
-    fn split(
-        self: Box<Self>,
-    ) -> (
-        Box<dyn OutboundDatagramRecvHalf>,
-        Box<dyn OutboundDatagramSendHalf>,
-    ) {
-        let r = Arc::new(self.inner);
-        let s = r.clone();
-        (
-            Box::new(StdOutboundDatagramRecvHalf(r)),
-            Box::new(StdOutboundDatagramSendHalf(s)),
-        )
-    }
-}
-
-pub struct StdOutboundDatagramRecvHalf(Arc<UdpSocket>);
-
-#[async_trait]
-impl OutboundDatagramRecvHalf for StdOutboundDatagramRecvHalf {
-    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocksAddr)> {
-        match self.0.recv_from(buf).await {
-            Ok((n, a)) => Ok((n, SocksAddr::Ip(unmapped_ipv4(a)))),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-pub struct StdOutboundDatagramSendHalf(Arc<UdpSocket>);
-
-#[async_trait]
-impl OutboundDatagramSendHalf for StdOutboundDatagramSendHalf {
-    async fn send_to(&mut self, buf: &[u8], target: &SocksAddr) -> io::Result<usize> {
-        // The type does not accept domain name.
-        self.0.send_to(buf, target.must_ip()).await
-    }
-
-    async fn close(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+use super::{
+    InboundDatagram, InboundDatagramRecvHalf, InboundDatagramSendHalf, OutboundDatagram,
+    OutboundDatagramRecvHalf, OutboundDatagramSendHalf,
+};
 
 /// An outbound datagram simply wraps a UDP socket.
 pub struct SimpleOutboundDatagram {
@@ -105,18 +51,6 @@ impl OutboundDatagram for SimpleOutboundDatagram {
     }
 }
 
-fn unmapped_ipv4(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V6(ref a) => {
-            if let Some(a_v4) = a.ip().to_ipv4() {
-                return SocketAddr::new(IpAddr::V4(a_v4), a.port());
-            }
-        }
-        _ => (),
-    }
-    addr
-}
-
 pub struct SimpleOutboundDatagramRecvHalf(Arc<UdpSocket>, Option<SocksAddr>);
 
 #[async_trait]
@@ -127,7 +61,7 @@ impl OutboundDatagramRecvHalf for SimpleOutboundDatagramRecvHalf {
                 if self.1.is_some() {
                     Ok((n, self.1.as_ref().unwrap().clone()))
                 } else {
-                    Ok((n, SocksAddr::Ip(unmapped_ipv4(a))))
+                    Ok((n, SocksAddr::Ip(a)))
                 }
             }
             Err(e) => Err(e),
@@ -167,10 +101,6 @@ impl OutboundDatagramSendHalf for SimpleOutboundDatagramSendHalf {
         };
         self.0.send_to(buf, &addr).await
     }
-
-    async fn close(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// An inbound datagram simply wraps a UDP socket.
@@ -203,21 +133,9 @@ impl InboundDatagramRecvHalf for SimpleInboundDatagramRecvHalf {
     async fn recv_from(
         &mut self,
         buf: &mut [u8],
-    ) -> ProxyResult<(usize, DatagramSource, SocksAddr)> {
-        let (n, src_addr) = self
-            .0
-            .recv_from(buf)
-            .map_err(|e| ProxyError::DatagramFatal(e.into()))
-            .await?;
-        Ok((
-            n,
-            DatagramSource::new(src_addr, None),
-            // This should be the target address which is decoded by proxy
-            // protocol layers, since this is a plain UDP socket, we use an
-            // empty address as a workaround to avoid introducing the Option type.
-            // The final address would be override by a proxy handler anyway.
-            SocksAddr::any_ipv4(),
-        ))
+    ) -> io::Result<(usize, DatagramSource, Option<SocksAddr>)> {
+        let (n, src_addr) = self.0.recv_from(buf).await?;
+        Ok((n, DatagramSource::new(src_addr, None), None))
     }
 }
 
@@ -228,13 +146,9 @@ impl InboundDatagramSendHalf for SimpleInboundDatagramSendHalf {
     async fn send_to(
         &mut self,
         buf: &[u8],
-        _src_addr: &SocksAddr,
+        _src_addr: Option<&SocksAddr>,
         dst_addr: &SocketAddr,
     ) -> io::Result<usize> {
         self.0.send_to(buf, dst_addr).await
-    }
-
-    async fn close(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }

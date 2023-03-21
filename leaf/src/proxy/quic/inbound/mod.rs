@@ -1,5 +1,5 @@
-mod datagram;
+mod udp;
 
-pub use datagram::Handler as DatagramHandler;
+pub use udp::Handler as UdpHandler;
 
 use super::QuicProxyStream;

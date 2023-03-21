@@ -1,5 +1,5 @@
-mod stream;
+mod tcp;
 
-pub use stream::Handler as StreamHandler;
+pub use tcp::Handler as TcpHandler;
 
 use super::QuicProxyStream;

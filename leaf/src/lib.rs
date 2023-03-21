@@ -3,6 +3,7 @@ use std::io;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Once;
 
 use anyhow::anyhow;
 use lazy_static::lazy_static;
@@ -19,9 +20,6 @@ use app::{
     dispatcher::Dispatcher, dns_client::DnsClient, inbound::manager::InboundManager,
     nat_manager::NatManager, outbound::manager::OutboundManager, router::Router,
 };
-
-#[cfg(feature = "stat")]
-use crate::app::{stat_manager::StatManager, SyncStatManager};
 
 #[cfg(feature = "api")]
 use crate::app::api::api_server::ApiServer;
@@ -74,8 +72,6 @@ pub struct RuntimeManager {
     router: Arc<RwLock<Router>>,
     dns_client: Arc<RwLock<DnsClient>>,
     outbound_manager: Arc<RwLock<OutboundManager>>,
-    #[cfg(feature = "stat")]
-    stat_manager: SyncStatManager,
     #[cfg(feature = "auto-reload")]
     watcher: Mutex<Option<RecommendedWatcher>>,
 }
@@ -91,7 +87,6 @@ impl RuntimeManager {
         router: Arc<RwLock<Router>>,
         dns_client: Arc<RwLock<DnsClient>>,
         outbound_manager: Arc<RwLock<OutboundManager>>,
-        #[cfg(feature = "stat")] stat_manager: SyncStatManager,
     ) -> Arc<Self> {
         Arc::new(Self {
             #[cfg(feature = "auto-reload")]
@@ -104,16 +99,9 @@ impl RuntimeManager {
             router,
             dns_client,
             outbound_manager,
-            #[cfg(feature = "stat")]
-            stat_manager,
             #[cfg(feature = "auto-reload")]
             watcher: Mutex::new(None),
         })
-    }
-
-    #[cfg(feature = "stat")]
-    pub fn stat_manager(&self) -> SyncStatManager {
-        self.stat_manager.clone()
     }
 
     pub async fn set_outbound_selected(&self, outbound: &str, select: &str) -> Result<(), Error> {
@@ -130,14 +118,9 @@ impl RuntimeManager {
 
     pub async fn get_outbound_selected(&self, outbound: &str) -> Result<String, Error> {
         if let Some(selector) = self.outbound_manager.read().await.get_selector(outbound) {
-            return Ok(selector.read().await.get_selected_tag());
-        }
-        Err(Error::Config(anyhow!("not found")))
-    }
-
-    pub async fn get_outbound_selects(&self, outbound: &str) -> Result<Vec<String>, Error> {
-        if let Some(selector) = self.outbound_manager.read().await.get_selector(outbound) {
-            return Ok(selector.read().await.get_available_tags());
+            if let Some(tag) = selector.read().await.get_selected_tag() {
+                return Ok(tag);
+            }
         }
         Err(Error::Config(anyhow!("not found")))
     }
@@ -154,7 +137,6 @@ impl RuntimeManager {
         };
         log::info!("reloading from config file: {}", config_path);
         let mut config = config::from_file(config_path).map_err(Error::Config)?;
-        app::logger::setup_logger(&config.log)?;
         self.router.write().await.reload(&mut config.router)?;
         self.dns_client.write().await.reload(&config.dns)?;
         self.outbound_manager
@@ -249,8 +231,10 @@ impl RuntimeManager {
                             // by an editor, in that case create a new watcher to watch
                             // the new file.
                             if let event::EventKind::Remove(event::RemoveKind::File) = ev.kind {
-                                if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&rt_id) {
-                                    let _ = m.new_watcher();
+                                if let Ok(g) = RUNTIME_MANAGER.lock() {
+                                    if let Some(m) = g.get(&rt_id) {
+                                        let _ = m.new_watcher();
+                                    }
                                 }
                             }
                         }
@@ -281,21 +265,21 @@ lazy_static! {
 }
 
 pub fn reload(key: RuntimeId) -> Result<(), Error> {
-    if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&key) {
-        return m.blocking_reload();
+    if let Ok(g) = RUNTIME_MANAGER.lock() {
+        if let Some(m) = g.get(&key) {
+            return m.blocking_reload();
+        }
     }
     Err(Error::RuntimeManager)
 }
 
 pub fn shutdown(key: RuntimeId) -> bool {
-    if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&key) {
-        return m.blocking_shutdown();
+    if let Ok(g) = RUNTIME_MANAGER.lock() {
+        if let Some(m) = g.get(&key) {
+            return m.blocking_shutdown();
+        }
     }
     false
-}
-
-pub fn is_running(key: RuntimeId) -> bool {
-    RUNTIME_MANAGER.lock().unwrap().contains_key(&key)
 }
 
 pub fn test_config(config_path: &str) -> Result<(), Error> {
@@ -339,7 +323,6 @@ pub enum RuntimeOption {
 #[derive(Debug)]
 pub enum Config {
     File(String),
-    Str(String),
     Internal(config::Config),
 }
 
@@ -350,6 +333,9 @@ pub struct StartOptions {
     // Enable auto reload, take effect only when "auto-reload" feature is enabled.
     #[cfg(feature = "auto-reload")]
     pub auto_reload: bool,
+    // The service path to protect outbound sockets on Android.
+    #[cfg(target_os = "android")]
+    pub socket_protect_path: Option<String>,
     // Tokio runtime options.
     pub runtime_opt: RuntimeOption,
 }
@@ -367,14 +353,27 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
 
     let mut config = match opts.config {
         Config::File(p) => config::from_file(&p).map_err(Error::Config)?,
-        Config::Str(s) => config::from_string(&s).map_err(Error::Config)?,
         Config::Internal(c) => c,
     };
 
-    app::logger::setup_logger(&config.log)?;
+    // FIXME Unfortunately fern does not allow re-initializing the logger,
+    // should consider another logging lib if the situation doesn't change.
+    let log = config
+        .log
+        .as_ref()
+        .ok_or_else(|| Error::Config(anyhow!("empty log setting")))?;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(move || {
+        app::logger::setup_logger(log).expect("setup logger failed");
+    });
 
     let rt = new_runtime(&opts.runtime_opt)?;
     let _g = rt.enter();
+
+    #[cfg(target_os = "android")]
+    if let Some(p) = opts.socket_protect_path.as_ref() {
+        rt.block_on(proxy::set_socket_protect_path(p.to_owned()));
+    }
 
     let mut tasks: Vec<Runner> = Vec::new();
     let mut runners = Vec::new();
@@ -389,27 +388,11 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         &mut config.router,
         dns_client.clone(),
     )));
-    #[cfg(feature = "stat")]
-    let stat_manager = Arc::new(RwLock::new(StatManager::new()));
-    #[cfg(feature = "stat")]
-    runners.push(StatManager::cleanup_task(stat_manager.clone()));
     let dispatcher = Arc::new(Dispatcher::new(
         outbound_manager.clone(),
         router.clone(),
         dns_client.clone(),
-        #[cfg(feature = "stat")]
-        stat_manager.clone(),
     ));
-
-    let dispatcher_weak = Arc::downgrade(&dispatcher);
-    let dns_client_cloned = dns_client.clone();
-    rt.block_on(async move {
-        dns_client_cloned
-            .write()
-            .await
-            .replace_dispatcher(dispatcher_weak);
-    });
-
     let nat_manager = Arc::new(NatManager::new(dispatcher.clone()));
     let inbound_manager =
         InboundManager::new(&config.inbounds, dispatcher, nat_manager).map_err(Error::Config)?;
@@ -468,8 +451,6 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         router,
         dns_client,
         outbound_manager,
-        #[cfg(feature = "stat")]
-        stat_manager,
     );
 
     // Monitor config file changes.
@@ -482,13 +463,20 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
 
     #[cfg(feature = "api")]
     {
-        use std::net::SocketAddr;
+        use std::net::{IpAddr, SocketAddr};
         let listen_addr = if !(&*option::API_LISTEN).is_empty() {
             Some(
                 (&*option::API_LISTEN)
                     .parse::<SocketAddr>()
                     .map_err(|e| Error::Config(anyhow!("parse SocketAddr failed: {}", e)))?,
             )
+        } else if let Some(api) = config.api.as_ref() {
+            Some(SocketAddr::new(
+                api.address
+                    .parse::<IpAddr>()
+                    .map_err(|e| Error::Config(anyhow!("parse IpAddr failed: {}", e)))?,
+                api.port as u16,
+            ))
         } else {
             None
         };
@@ -531,63 +519,24 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         let _ = tokio::signal::ctrl_c().await;
     }));
 
-    RUNTIME_MANAGER.lock().unwrap().insert(rt_id, runtime_manager);
-
-    log::trace!("added runtime {}", &rt_id);
+    RUNTIME_MANAGER
+        .lock()
+        .map_err(|_| Error::RuntimeManager)?
+        .insert(rt_id, runtime_manager);
 
     rt.block_on(futures::future::select_all(tasks));
 
     #[cfg(all(feature = "inbound-tun", any(target_os = "macos", target_os = "linux")))]
     sys::post_tun_completion_setup(&net_info);
 
-    drop(inbound_manager);
-
-    RUNTIME_MANAGER.lock().unwrap().remove(&rt_id);
-
     rt.shutdown_background();
 
-    log::trace!("removed runtime {}", &rt_id);
+    RUNTIME_MANAGER
+        .lock()
+        .map_err(|_| Error::RuntimeManager)?
+        .remove(&rt_id);
+
+    log::trace!("leaf shutdown");
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-
-    #[test]
-    fn test_restart() {
-        let conf = r#"
-[General]
-loglevel = trace
-dns-server = 1.1.1.1
-socks-interface = 127.0.0.1
-socks-port = 1080
-# tun = auto
-
-[Proxy]
-Direct = direct
-"#;
-
-        for _i in 1..3 {
-            thread::spawn(move || {
-                let opts = StartOptions {
-                    config: Config::Str(conf.to_string()),
-                    #[cfg(feature = "auto-reload")]
-                    auto_reload: false,
-                    runtime_opt: RuntimeOption::SingleThread,
-                };
-                start(0, opts).unwrap();
-            });
-            thread::sleep(std::time::Duration::from_secs(2));
-            assert!(shutdown(0));
-            loop {
-                thread::sleep(std::time::Duration::from_secs(1));
-                if !is_running(0) {
-                    break;
-                }
-            }
-        }
-    }
 }

@@ -1,5 +1,5 @@
-mod stream;
-mod datagram;
+mod tcp;
+mod udp;
 
-pub use stream::Handler as StreamHandler;
-pub use datagram::Handler as DatagramHandler;
+pub use tcp::Handler as TcpHandler;
+pub use udp::Handler as UdpHandler;

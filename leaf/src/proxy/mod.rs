@@ -11,10 +11,10 @@ use futures::TryFutureExt;
 use futures::lock::Mutex;
 use log::*;
 use socket2::SockRef;
-use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
+use lazy_static::lazy_static;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -30,12 +30,15 @@ use crate::{
     app::SyncDnsClient,
     common::resolver::Resolver,
     option,
-    session::{DatagramSource, Network, Session, SocksAddr},
+    session::{DatagramSource, Session, SocksAddr},
 };
 
 pub mod datagram;
 pub mod inbound;
 pub mod outbound;
+pub mod stream;
+
+pub mod null;
 
 #[cfg(any(feature = "inbound-amux", feature = "outbound-amux"))]
 pub mod amux;
@@ -51,16 +54,20 @@ pub mod failover;
 pub mod http;
 #[cfg(any(feature = "inbound-quic", feature = "outbound-quic"))]
 pub mod quic;
+#[cfg(feature = "outbound-random")]
+pub mod random;
 #[cfg(feature = "outbound-redirect")]
 pub mod redirect;
+#[cfg(feature = "outbound-retry")]
+pub mod retry;
+#[cfg(feature = "outbound-rr")]
+pub mod rr;
 #[cfg(feature = "outbound-select")]
 pub mod select;
 #[cfg(any(feature = "inbound-shadowsocks", feature = "outbound-shadowsocks"))]
 pub mod shadowsocks;
 #[cfg(any(feature = "inbound-socks", feature = "outbound-socks"))]
 pub mod socks;
-#[cfg(feature = "outbound-static")]
-pub mod r#static;
 #[cfg(feature = "outbound-tls")]
 pub mod tls;
 #[cfg(any(feature = "inbound-trojan", feature = "outbound-trojan"))]
@@ -77,32 +84,20 @@ pub mod tryall;
     )
 ))]
 pub mod tun;
-#[cfg(feature = "outbound-vmess")]
-pub mod vmess;
 #[cfg(any(feature = "inbound-ws", feature = "outbound-ws"))]
 pub mod ws;
 
 pub use datagram::{
     SimpleInboundDatagram, SimpleInboundDatagramRecvHalf, SimpleInboundDatagramSendHalf,
     SimpleOutboundDatagram, SimpleOutboundDatagramRecvHalf, SimpleOutboundDatagramSendHalf,
-    StdOutboundDatagram,
 };
-
-#[derive(Error, Debug)]
-pub enum ProxyError {
-    #[error(transparent)]
-    DatagramWarn(anyhow::Error),
-    #[error(transparent)]
-    DatagramFatal(anyhow::Error),
-}
-
-pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
+pub use stream::BufHeadProxyStream;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DatagramTransportType {
-    Reliable,
-    Unreliable,
-    Unknown,
+    Stream,
+    Datagram,
+    Undefined,
 }
 
 pub trait Tag {
@@ -110,7 +105,12 @@ pub trait Tag {
 }
 
 pub trait Color {
-    fn color(&self) -> &colored::Color;
+    fn color(&self) -> colored::Color;
+}
+
+#[cfg(target_os = "android")]
+lazy_static! {
+    static ref SOCKET_PROTECT_PATH: Mutex<Option<String>> = Mutex::new(None);
 }
 
 #[derive(Debug)]
@@ -119,26 +119,25 @@ pub enum OutboundBind {
     Interface(String),
 }
 
+// Sets the RPC service endpoint for protecting outbound sockets on Android to
+// avoid infinite loop. The `path` is treated as a Unix domain socket endpoint.
+// The RPC service simply listens for incoming connections, reads an int32 on
+// each connection, treats it as the file descriptor to protect, writes back 0
+// on success.
 #[cfg(target_os = "android")]
-async fn protect_socket(fd: RawFd) -> io::Result<()> {
-    // TODO Warns about empty protect path?
-    if let Some(addr) = &*option::SOCKET_PROTECT_SERVER {
-        let mut stream = TcpStream::connect(addr).await?;
-        stream.write_i32(fd as i32).await?;
+pub async fn set_socket_protect_path(path: String) {
+    SOCKET_PROTECT_PATH.lock().await.replace(path);
+}
+
+#[cfg(target_os = "android")]
+async fn protect_socket<S: AsRawFd>(socket: S) -> io::Result<()> {
+    if let Some(path) = SOCKET_PROTECT_PATH.lock().await.as_ref() {
+        let mut stream = UnixStream::connect(path).await?;
+        stream.write_i32(socket.as_raw_fd() as i32).await?;
         if stream.read_i32().await? != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("failed to protect outbound socket {}", fd),
-            ));
-        }
-    }
-    if !option::SOCKET_PROTECT_PATH.is_empty() {
-        let mut stream = UnixStream::connect(&*option::SOCKET_PROTECT_PATH).await?;
-        stream.write_i32(fd as i32).await?;
-        if stream.read_i32().await? != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to protect outbound socket {}", fd),
+                format!("failed to protect outbound socket {}", socket.as_raw_fd()),
             ));
         }
     }
@@ -181,7 +180,6 @@ impl TcpListener {
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (stream, addr) = self.inner.accept().await?;
         apply_socket_opts(&stream)?;
-        stream.set_linger(Some(Duration::ZERO))?;
         Ok((stream, addr))
     }
 }
@@ -214,20 +212,28 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                     }
 
                     let ret = match indicator {
-                        SocketAddr::V4(..) => libc::setsockopt(
-                            socket.as_raw_fd(),
-                            libc::IPPROTO_IP,
-                            libc::IP_BOUND_IF,
-                            &ifidx as *const _ as *const libc::c_void,
-                            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-                        ),
-                        SocketAddr::V6(..) => libc::setsockopt(
-                            socket.as_raw_fd(),
-                            libc::IPPROTO_IPV6,
-                            libc::IPV6_BOUND_IF,
-                            &ifidx as *const _ as *const libc::c_void,
-                            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-                        ),
+                        SocketAddr::V4(..) => {
+                            // https://github.com/apple/darwin-xnu/blob/8f02f2a044b9bb1ad951987ef5bab20ec9486310/bsd/netinet/in.h#L484
+                            const IP_BOUND_IF: libc::c_int = 25;
+                            libc::setsockopt(
+                                socket.as_raw_fd(),
+                                libc::IPPROTO_IP,
+                                IP_BOUND_IF,
+                                &ifidx as *const _ as *const libc::c_void,
+                                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                            )
+                        }
+                        SocketAddr::V6(..) => {
+                            // https://github.com/apple/darwin-xnu/blob/8f02f2a044b9bb1ad951987ef5bab20ec9486310/bsd/netinet6/in6.h#L692
+                            const IPV6_BOUND_IF: libc::c_int = 125;
+                            libc::setsockopt(
+                                socket.as_raw_fd(),
+                                libc::IPPROTO_IPV6,
+                                IPV6_BOUND_IF,
+                                &ifidx as *const _ as *const libc::c_void,
+                                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                            )
+                        }
                     };
                     if ret == -1 {
                         last_err = Some(io::Error::last_os_error());
@@ -262,16 +268,12 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                 }
             }
             OutboundBind::Ip(addr) => {
-                if (addr.is_ipv4() && indicator.is_ipv4())
-                    || (addr.is_ipv6() && indicator.is_ipv6())
-                {
-                    if let Err(e) = socket.bind(addr) {
-                        last_err = Some(e);
-                        continue;
-                    }
-                    trace!("socket bind {}", addr);
-                    return Ok(());
+                if let Err(e) = socket.bind(addr) {
+                    last_err = Some(e);
+                    continue;
                 }
+                trace!("socket bind {}", addr);
+                return Ok(());
             }
         }
     }
@@ -286,25 +288,13 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
 // New UDP socket.
 pub async fn new_udp_socket(indicator: &SocketAddr) -> io::Result<UdpSocket> {
     use socket2::{Domain, Socket, Type};
-    let socket = if *option::ENABLE_IPV6 {
-        // Dual-stack socket.
-        // FIXME Windows IPV6_V6ONLY?
-        Socket::new(Domain::IPV6, Type::DGRAM, None)?
-    } else {
-        match indicator {
-            SocketAddr::V4(..) => Socket::new(Domain::IPV4, Type::DGRAM, None)?,
-            SocketAddr::V6(..) => Socket::new(Domain::IPV6, Type::DGRAM, None)?,
-        }
+    let socket = match indicator {
+        SocketAddr::V4(..) => Socket::new(Domain::IPV4, Type::DGRAM, None)?,
+        SocketAddr::V6(..) => Socket::new(Domain::IPV6, Type::DGRAM, None)?,
     };
     socket.set_nonblocking(true)?;
 
-    // If the proxy request is coming from an inbound listens on the loopback,
-    // the indicator could be a loopback address, we must ignore it.
-    if indicator.ip().is_loopback() || *option::ENABLE_IPV6 {
-        bind_socket(&socket, &*option::UNSPECIFIED_BIND_ADDR).await?;
-    } else {
-        bind_socket(&socket, indicator).await?;
-    }
+    bind_socket(&socket, indicator).await?;
 
     #[cfg(target_os = "android")]
     protect_socket(socket.as_raw_fd()).await?;
@@ -321,27 +311,15 @@ fn apply_socket_opts<S: AsRawFd>(socket: &S) -> io::Result<()> {
     let sock_ref = SockRef::from(socket);
     apply_socket_opts_internal(sock_ref)
 }
+
 #[cfg(windows)]
 fn apply_socket_opts<S: AsRawSocket>(socket: &S) -> io::Result<()> {
     let sock_ref = SockRef::from(socket);
     apply_socket_opts_internal(sock_ref)
 }
 
-// TCP dial order.
-#[derive(PartialEq)]
-pub enum DialOrder {
-    // Leave the order of IPs untouched.
-    Ordered,
-    // Randomize the IPs.
-    Random,
-    // Randomize the IPs except the first one. We have a little optimization in
-    // the DNS client that moves the previously connected IP to the head, we want
-    // that IP always tried first.
-    PartialRandom,
-}
-
 // A single TCP dial.
-async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<DialResult> {
+async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<(AnyStream, SocketAddr)> {
     let socket = match dial_addr {
         SocketAddr::V4(..) => TcpSocket::new_v4()?,
         SocketAddr::V6(..) => TcpSocket::new_v6()?,
@@ -353,38 +331,28 @@ async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<DialResult> {
     protect_socket(socket.as_raw_fd()).await?;
 
     trace!("tcp dialing {}", &dial_addr);
-    let start = tokio::time::Instant::now();
     let stream = timeout(
         Duration::from_secs(*option::OUTBOUND_DIAL_TIMEOUT),
         socket.connect(dial_addr),
     )
     .await??;
-    let elapsed = tokio::time::Instant::now().duration_since(start);
 
     apply_socket_opts(&stream)?;
 
-    trace!(
-        "tcp {} <-> {} connected in {}ms",
-        stream.local_addr()?,
-        &dial_addr,
-        elapsed.as_millis()
-    );
-    Ok(DialResult {
-        stream: Box::new(stream),
-        addr: dial_addr,
-    })
+    trace!("tcp connected {} <-> {}", stream.local_addr()?, &dial_addr);
+    Ok((Box::new(stream), dial_addr))
 }
 
-pub async fn connect_stream_outbound(
+pub async fn connect_tcp_outbound(
     sess: &Session,
     dns_client: SyncDnsClient,
     handler: &AnyOutboundHandler,
 ) -> io::Result<Option<AnyStream>> {
-    match handler.stream()?.connect_addr() {
-        OutboundConnect::Proxy(Network::Tcp, addr, port) => {
+    match TcpOutboundHandler::connect_addr(handler.as_ref()) {
+        Some(OutboundConnect::Proxy(addr, port)) => {
             Ok(Some(new_tcp_stream(dns_client, &addr, &port).await?))
         }
-        OutboundConnect::Direct => Ok(Some(
+        Some(OutboundConnect::Direct) => Ok(Some(
             new_tcp_stream(
                 dns_client,
                 &sess.destination.host(),
@@ -392,29 +360,32 @@ pub async fn connect_stream_outbound(
             )
             .await?,
         )),
-        _ => Ok(None),
+        Some(OutboundConnect::NoConnect) | None => Ok(None),
     }
 }
 
-pub async fn connect_datagram_outbound(
+pub async fn connect_udp_outbound(
     sess: &Session,
     dns_client: SyncDnsClient,
     handler: &AnyOutboundHandler,
 ) -> io::Result<Option<AnyOutboundTransport>> {
-    match handler.datagram()?.connect_addr() {
-        OutboundConnect::Proxy(network, addr, port) => match network {
-            Network::Udp => {
-                let socket = new_udp_socket(&sess.source).await?;
-                Ok(Some(OutboundTransport::Datagram(Box::new(
-                    SimpleOutboundDatagram::new(socket, None, dns_client.clone()),
-                ))))
+    match UdpOutboundHandler::connect_addr(handler.as_ref()) {
+        Some(OutboundConnect::Proxy(addr, port)) => {
+            match UdpOutboundHandler::transport_type(handler.as_ref()) {
+                DatagramTransportType::Datagram => {
+                    let socket = new_udp_socket(&sess.source).await?;
+                    Ok(Some(OutboundTransport::Datagram(Box::new(
+                        SimpleOutboundDatagram::new(socket, None, dns_client.clone()),
+                    ))))
+                }
+                DatagramTransportType::Stream => {
+                    let stream = new_tcp_stream(dns_client.clone(), &addr, &port).await?;
+                    Ok(Some(OutboundTransport::Stream(stream)))
+                }
+                DatagramTransportType::Undefined => Ok(None),
             }
-            Network::Tcp => {
-                let stream = new_tcp_stream(dns_client.clone(), &addr, &port).await?;
-                Ok(Some(OutboundTransport::Stream(stream)))
-            }
-        },
-        OutboundConnect::Direct => {
+        }
+        Some(OutboundConnect::Direct) => {
             let socket = new_udp_socket(&sess.source).await?;
             let dest = match &sess.destination {
                 SocksAddr::Domain(domain, port) => {
@@ -426,13 +397,8 @@ pub async fn connect_datagram_outbound(
                 SimpleOutboundDatagram::new(socket, dest, dns_client.clone()),
             ))))
         }
-        _ => Ok(None),
+        Some(OutboundConnect::NoConnect) | None => Ok(None),
     }
-}
-
-struct DialResult {
-    stream: AnyStream,
-    addr: SocketAddr,
 }
 
 // Dials a TCP stream.
@@ -470,12 +436,10 @@ pub async fn new_tcp_stream(
         if !tasks.is_empty() {
             match select_ok(tasks.into_iter()).await {
                 Ok(v) => {
-                    dns_client
-                        .read()
-                        .await
-                        .optimize_cache(address.to_owned(), v.0.addr.ip())
-                        .await;
-                    return Ok(v.0.stream);
+                    #[rustfmt::skip]
+                    dns_client.read().await.optimize_cache(address.to_owned(), v.0.1.ip()).await;
+                    #[rustfmt::skip]
+                    return Ok(v.0.0);
                 }
                 Err(e) => {
                     last_err = Some(io::Error::new(
@@ -526,34 +490,41 @@ impl<S> ProxyStream for S where S: AsyncRead + AsyncWrite + Send + Sync + Unpin 
 pub type AnyStream = Box<dyn ProxyStream>;
 
 /// An outbound handler for both UDP and TCP outgoing connections.
-pub trait OutboundHandler: Tag + Color + Sync + Send + Unpin {
-    fn stream(&self) -> io::Result<&AnyOutboundStreamHandler>;
-    fn datagram(&self) -> io::Result<&AnyOutboundDatagramHandler>;
+pub trait OutboundHandler:
+    TcpOutboundHandler + UdpOutboundHandler + Tag + Color + Send + Unpin
+{
 }
 
-pub type AnyOutboundHandler = Arc<dyn OutboundHandler>;
+pub type AnyOutboundHandler = Arc<
+    dyn OutboundHandler<Stream = AnyStream, UStream = AnyStream, Datagram = AnyOutboundDatagram>,
+>;
 
 #[derive(Debug, Clone)]
 pub enum OutboundConnect {
-    Proxy(Network, String, u16),
+    Proxy(String, u16),
     Direct,
-    Next,
-    Unknown,
+    NoConnect,
 }
 
 /// An outbound handler for outgoing TCP conections.
 #[async_trait]
-pub trait OutboundStreamHandler<S = AnyStream>: Send + Sync + Unpin {
+pub trait TcpOutboundHandler: Send + Sync + Unpin {
+    type Stream;
+
     /// Returns the address which the underlying transport should
     /// communicate with.
-    fn connect_addr(&self) -> OutboundConnect;
+    fn connect_addr(&self) -> Option<OutboundConnect>;
 
     /// Handles a session with the given stream. On success, returns a
     /// stream wraps the incoming stream.
-    async fn handle<'a>(&'a self, sess: &'a Session, stream: Option<S>) -> io::Result<S>;
+    async fn handle<'a>(
+        &'a self,
+        sess: &'a Session,
+        stream: Option<Self::Stream>,
+    ) -> io::Result<Self::Stream>;
 }
 
-type AnyOutboundStreamHandler = Box<dyn OutboundStreamHandler>;
+type AnyTcpOutboundHandler = Box<dyn TcpOutboundHandler<Stream = AnyStream>>;
 
 /// An unreliable transport for outbound handlers.
 pub trait OutboundDatagram: Send + Unpin {
@@ -581,22 +552,27 @@ pub trait OutboundDatagramRecvHalf: Sync + Send + Unpin {
 pub trait OutboundDatagramSendHalf: Sync + Send + Unpin {
     /// Sends a message on the socket to `dst_addr`. On success, returns the
     /// number of bytes sent.
+    ///
+    /// `dst_addr` is not the proxy server address.
     async fn send_to(&mut self, buf: &[u8], dst_addr: &SocksAddr) -> io::Result<usize>;
-
-    /// Close the soccket gracefully.
-    async fn close(&mut self) -> io::Result<()>;
 }
 
 /// An outbound handler for outgoing UDP connections.
 #[async_trait]
-pub trait OutboundDatagramHandler<S = AnyStream, D = AnyOutboundDatagram>:
-    Send + Sync + Unpin
-{
+pub trait UdpOutboundHandler: Send + Sync + Unpin {
+    type UStream;
+    type Datagram;
+
     /// Returns the address which the underlying transport should
     /// communicate with.
-    fn connect_addr(&self) -> OutboundConnect;
+    fn connect_addr(&self) -> Option<OutboundConnect>;
 
     /// Returns the transport type of this handler.
+    ///
+    /// For example, for a SOCKS5 handler, the UDP transport type is
+    /// `DatagramTransportType::Datagram`, but for a trojan handler, the transport
+    /// type is `DatagramTransportType::Stream` because trojan transport UDP
+    /// packets over TCP connections.
     fn transport_type(&self) -> DatagramTransportType;
 
     /// Handles a session with the transport. On success, returns an outbound
@@ -604,11 +580,12 @@ pub trait OutboundDatagramHandler<S = AnyStream, D = AnyOutboundDatagram>:
     async fn handle<'a>(
         &'a self,
         sess: &'a Session,
-        transport: Option<OutboundTransport<S, D>>,
-    ) -> io::Result<D>;
+        transport: Option<OutboundTransport<Self::UStream, Self::Datagram>>,
+    ) -> io::Result<Self::Datagram>;
 }
 
-type AnyOutboundDatagramHandler = Box<dyn OutboundDatagramHandler>;
+type AnyUdpOutboundHandler =
+    Box<dyn UdpOutboundHandler<UStream = AnyStream, Datagram = AnyOutboundDatagram>>;
 
 /// An outbound transport represents either a reliable or unreliable transport.
 pub enum OutboundTransport<S, D> {
@@ -620,34 +597,52 @@ pub enum OutboundTransport<S, D> {
 
 pub type AnyOutboundTransport = OutboundTransport<AnyStream, AnyOutboundDatagram>;
 
-pub trait InboundHandler: Tag + Send + Sync + Unpin {
-    fn stream(&self) -> io::Result<&AnyInboundStreamHandler>;
-    fn datagram(&self) -> io::Result<&AnyInboundDatagramHandler>;
+pub trait InboundHandler:
+    TcpInboundHandler + UdpInboundHandler + Tag + Send + Sync + Unpin
+{
+    fn has_tcp(&self) -> bool;
+    fn has_udp(&self) -> bool;
 }
 
-pub type AnyInboundHandler = Arc<dyn InboundHandler>;
+pub type AnyInboundHandler = Arc<
+    dyn InboundHandler<
+        TStream = AnyStream,
+        TDatagram = AnyInboundDatagram,
+        UStream = AnyStream,
+        UDatagram = AnyInboundDatagram,
+    >,
+>;
 
 /// An inbound handler for incoming TCP connections.
 #[async_trait]
-pub trait InboundStreamHandler<S = AnyStream, D = AnyInboundDatagram>: Send + Sync + Unpin {
+pub trait TcpInboundHandler: Send + Sync + Unpin {
+    type TStream;
+    type TDatagram;
+
     async fn handle<'a>(
         &'a self,
         sess: Session,
-        stream: S,
-    ) -> std::io::Result<InboundTransport<S, D>>;
+        stream: Self::TStream,
+    ) -> std::io::Result<InboundTransport<Self::TStream, Self::TDatagram>>;
 }
 
-pub type AnyInboundStreamHandler = Arc<dyn InboundStreamHandler>;
+pub type AnyTcpInboundHandler =
+    Arc<dyn TcpInboundHandler<TStream = AnyStream, TDatagram = AnyInboundDatagram>>;
 
 /// An inbound handler for incoming UDP connections.
 #[async_trait]
-pub trait InboundDatagramHandler<S = AnyStream, D = AnyInboundDatagram>:
-    Send + Sync + Unpin
-{
-    async fn handle<'a>(&'a self, socket: D) -> io::Result<InboundTransport<S, D>>;
+pub trait UdpInboundHandler: Send + Sync + Unpin {
+    type UStream;
+    type UDatagram;
+
+    async fn handle<'a>(
+        &'a self,
+        socket: Self::UDatagram,
+    ) -> io::Result<InboundTransport<Self::UStream, Self::UDatagram>>;
 }
 
-pub type AnyInboundDatagramHandler = Arc<dyn InboundDatagramHandler>;
+pub type AnyUdpInboundHandler =
+    Arc<dyn UdpInboundHandler<UStream = AnyStream, UDatagram = AnyInboundDatagram>>;
 
 /// An unreliable transport for inbound handlers.
 pub trait InboundDatagram: Send + Sync + Unpin {
@@ -671,10 +666,14 @@ pub trait InboundDatagramRecvHalf: Sync + Send + Unpin {
     /// Receives a single datagram message on the socket. On success, returns
     /// the number of bytes read, the source where this message
     /// originated and the destination this message shall be sent to.
+    ///
+    /// This should be implemented by a proxy inbound handler, the destination
+    /// address could be decoded from the raw message according to the protocol
+    /// specification.
     async fn recv_from(
         &mut self,
         buf: &mut [u8],
-    ) -> ProxyResult<(usize, DatagramSource, SocksAddr)>;
+    ) -> io::Result<(usize, DatagramSource, Option<SocksAddr>)>;
 }
 
 /// The send half.
@@ -683,22 +682,23 @@ pub trait InboundDatagramSendHalf: Sync + Send + Unpin {
     /// Sends a datagram message on the socket to `dst_addr`, the `src_addr`
     /// specifies the origin of the message. On success, returns the number
     /// of bytes sent.
+    ///
+    /// This should be implemented by a proxy inbound handler, and the
+    /// `src_addr` should be encapsulated into the protocol header to indicate
+    /// the origin of the message.
     async fn send_to(
         &mut self,
         buf: &[u8],
-        src_addr: &SocksAddr,
+        src_addr: Option<&SocksAddr>,
         dst_addr: &SocketAddr,
     ) -> io::Result<usize>;
-
-    /// Close the socket gracefully.
-    async fn close(&mut self) -> io::Result<()>;
 }
 
 pub enum BaseInboundTransport<S, D> {
     /// The reliable transport.
     Stream(S, Session),
     /// The unreliable transport.
-    Datagram(D, Option<Session>),
+    Datagram(D),
     /// None.
     Empty,
 }
@@ -715,8 +715,7 @@ pub enum InboundTransport<S, D> {
     /// The reliable transport.
     Stream(S, Session),
     /// The unreliable transport.
-    Datagram(D, Option<Session>),
-    /// Incoming transports can be either reliable or unreliable.
+    Datagram(D),
     Incoming(IncomingTransport<S, D>),
     /// None.
     Empty,

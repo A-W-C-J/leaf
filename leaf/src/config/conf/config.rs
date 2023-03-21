@@ -25,7 +25,6 @@ pub struct General {
     pub tun_fd: Option<i32>,
     pub tun_auto: Option<bool>,
     pub loglevel: Option<String>,
-    pub logoutput: Option<String>,
     pub dns_server: Option<Vec<String>>,
     pub dns_interface: Option<String>,
     pub always_real_ip: Option<Vec<String>>,
@@ -57,15 +56,11 @@ pub struct Proxy {
 
     pub ws: Option<bool>,
     pub tls: Option<bool>,
-    pub tls_cert: Option<String>,
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
 
     // trojan
     pub sni: Option<String>,
-
-    // vmess
-    pub username: Option<String>,
 
     pub amux: Option<bool>,
     pub amux_max: Option<i32>,
@@ -86,11 +81,9 @@ impl Default for Proxy {
             password: None,
             ws: Some(false),
             tls: Some(false),
-            tls_cert: None,
             ws_path: None,
             ws_host: None,
             sni: None,
-            username: None,
             amux: Some(false),
             amux_max: Some(8),
             amux_con: Some(2),
@@ -112,16 +105,12 @@ pub struct ProxyGroup {
     pub fallback_cache: Option<bool>,
     pub cache_size: Option<i32>,
     pub cache_timeout: Option<i32>,
-    pub last_resort: Option<String>,
-    pub health_check_timeout: Option<i32>,
-    pub health_check_delay: Option<i32>,
-    pub health_check_active: Option<i32>,
 
     // tryall
     pub delay_base: Option<i32>,
 
-    // static
-    pub method: Option<String>,
+    // retry
+    pub attempts: Option<i32>,
 }
 
 impl Default for ProxyGroup {
@@ -130,19 +119,15 @@ impl Default for ProxyGroup {
             tag: "".to_string(),
             protocol: "".to_string(),
             actors: None,
-            health_check: None,
-            check_interval: None,
-            fail_timeout: None,
-            failover: None,
-            fallback_cache: None,
-            cache_size: None,
-            cache_timeout: None,
-            last_resort: None,
-            health_check_timeout: None,
-            health_check_delay: None,
-            health_check_active: None,
-            delay_base: None,
-            method: None,
+            health_check: Some(true),
+            check_interval: Some(300),
+            fail_timeout: Some(4),
+            failover: Some(true),
+            fallback_cache: Some(false),
+            cache_size: Some(256),
+            cache_timeout: Some(60),
+            delay_base: Some(0),
+            attempts: Some(2),
         }
     }
 }
@@ -239,15 +224,6 @@ where
 }
 
 pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
-    let env_lines = get_lines_by_section("Env", lines.iter());
-    for line in env_lines {
-        let parts: Vec<&str> = line.split('=').map(str::trim).collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        std::env::set_var(parts[0], parts[1]);
-    }
-
     let mut general = General::default();
     let general_lines = get_lines_by_section("General", lines.iter());
     for line in general_lines {
@@ -280,9 +256,6 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
             }
             "loglevel" => {
                 general.loglevel = Some(parts[1].to_string());
-            }
-            "logoutput" => {
-                general.logoutput = Some(parts[1].to_string());
             }
             "dns-server" => {
                 general.dns_server = get_char_sep_slice(parts[1], ',');
@@ -371,9 +344,6 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                 }
                 "ws" => proxy.ws = if v == "true" { Some(true) } else { Some(false) },
                 "tls" => proxy.tls = if v == "true" { Some(true) } else { Some(false) },
-                "tls-cert" => {
-                    proxy.tls_cert = Some(v.to_string());
-                }
                 "ws-path" => {
                     proxy.ws_path = Some(v.to_string());
                 }
@@ -382,9 +352,6 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                 }
                 "sni" => {
                     proxy.sni = Some(v.to_string());
-                }
-                "username" => {
-                    proxy.username = Some(v.to_string());
                 }
                 "amux" => proxy.amux = if v == "true" { Some(true) } else { Some(false) },
                 "amux-max" => {
@@ -548,38 +515,6 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                         };
                         group.cache_timeout = i;
                     }
-                    "last-resort" => {
-                        let i = if let Ok(i) = v.parse::<String>() {
-                            Some(i)
-                        } else {
-                            None
-                        };
-                        group.last_resort = i;
-                    }
-                    "health-check-timeout" => {
-                        let i = if let Ok(i) = v.parse::<i32>() {
-                            Some(i)
-                        } else {
-                            None
-                        };
-                        group.health_check_timeout = i;
-                    }
-                    "health-check-delay" => {
-                        let i = if let Ok(i) = v.parse::<i32>() {
-                            Some(i)
-                        } else {
-                            None
-                        };
-                        group.health_check_delay = i;
-                    }
-                    "health-check-active" => {
-                        let i = if let Ok(i) = v.parse::<i32>() {
-                            Some(i)
-                        } else {
-                            None
-                        };
-                        group.health_check_active = i;
-                    }
                     "delay-base" => {
                         let i = if let Ok(i) = v.parse::<i32>() {
                             Some(i)
@@ -588,13 +523,13 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                         };
                         group.delay_base = i;
                     }
-                    "method" => {
-                        let i = if let Ok(i) = v.parse::<String>() {
+                    "attempts" => {
+                        let i = if let Ok(i) = v.parse::<i32>() {
                             Some(i)
                         } else {
                             None
                         };
-                        group.method = i;
+                        group.attempts = i;
                     }
                     _ => {}
                 }
@@ -638,7 +573,7 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
         if rule.type_field == "FINAL" {
             rule.target = params[1].to_string();
             rules.push(rule);
-            break; // FINAL is final.
+            continue; // maybe break? to enforce FINAL as the final rule
         }
 
         if params.len() < 3 {
@@ -650,7 +585,7 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
 
         match rule.type_field.as_str() {
             "IP-CIDR" | "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "GEOIP" | "EXTERNAL"
-            | "PORT-RANGE" | "NETWORK" | "INBOUND-TAG" => {
+            | "PORT-RANGE" => {
                 rule.filter = Some(params[1].to_string());
             }
             _ => {}
@@ -689,28 +624,22 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
     if let Some(ext_general) = &conf.general {
         if let Some(ext_loglevel) = &ext_general.loglevel {
             match ext_loglevel.as_str() {
-                "trace" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::TRACE),
-                "debug" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::DEBUG),
-                "info" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::INFO),
-                "warn" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::WARN),
-                "error" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::ERROR),
-                _ => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::WARN),
+                "trace" => log.level = internal::Log_Level::TRACE,
+                "debug" => log.level = internal::Log_Level::DEBUG,
+                "info" => log.level = internal::Log_Level::INFO,
+                "warn" => log.level = internal::Log_Level::WARN,
+                "error" => log.level = internal::Log_Level::ERROR,
+                _ => log.level = internal::Log_Level::WARN,
             }
+        } else {
+            log.level = internal::Log_Level::INFO;
         }
-        if let Some(ext_logoutput) = &ext_general.logoutput {
-            match ext_logoutput.as_str() {
-                "console" => {
-                    log.output = protobuf::EnumOrUnknown::new(internal::log::Output::CONSOLE)
-                }
-                _ => {
-                    log.output = protobuf::EnumOrUnknown::new(internal::log::Output::FILE);
-                    log.output_file = ext_logoutput.clone();
-                }
-            }
-        }
+    } else {
+        log.level = internal::Log_Level::INFO;
     }
+    log.output = internal::Log_Output::CONSOLE; // unimplemented
 
-    let mut inbounds = Vec::new();
+    let mut inbounds = protobuf::RepeatedField::new();
     if let Some(ext_general) = &conf.general {
         if ext_general.http_interface.is_some() && ext_general.http_port.is_some() {
             let mut inbound = internal::Inbound::new();
@@ -738,7 +667,7 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
             inbound.tag = "tun".to_string();
             let mut settings = internal::TunInboundSettings::new();
 
-            let mut fake_dns_exclude = Vec::new();
+            let mut fake_dns_exclude = protobuf::RepeatedField::new();
             if let Some(ext_always_real_ip) = &ext_general.always_real_ip {
                 for item in ext_always_real_ip {
                     fake_dns_exclude.push(item.clone())
@@ -748,7 +677,7 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                 }
             }
 
-            let mut fake_dns_include = Vec::new();
+            let mut fake_dns_include = protobuf::RepeatedField::new();
             if let Some(ext_always_fake_ip) = &ext_general.always_fake_ip {
                 for item in ext_always_fake_ip {
                     fake_dns_include.push(item.clone())
@@ -793,7 +722,7 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
         }
     }
 
-    let mut outbounds = Vec::new();
+    let mut outbounds = protobuf::RepeatedField::new();
     if let Some(ext_proxies) = &conf.proxy {
         for ext_proxy in ext_proxies {
             let mut outbound = internal::Outbound::new();
@@ -807,18 +736,6 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                 "direct" | "drop" => {
                     outbounds.push(outbound);
                 }
-                "redirect" => {
-                    let mut settings = internal::RedirectOutboundSettings::new();
-                    if let Some(ext_address) = &ext_proxy.address {
-                        settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        settings.port = *ext_port as u32;
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
-                }
                 "socks" => {
                     let mut settings = internal::SocksOutboundSettings::new();
                     if let Some(ext_address) = &ext_proxy.address {
@@ -826,12 +743,6 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     }
                     if let Some(ext_port) = &ext_proxy.port {
                         settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_username) = &ext_proxy.username {
-                        settings.username = ext_username.clone();
-                    }
-                    if let Some(ext_password) = &ext_proxy.password {
-                        settings.password = ext_password.clone();
                     }
                     let settings = settings.write_to_bytes().unwrap();
                     outbound.settings = settings;
@@ -864,16 +775,6 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     let mut tls_settings = internal::TlsOutboundSettings::new();
                     if let Some(ext_sni) = &ext_proxy.sni {
                         tls_settings.server_name = ext_sni.clone();
-                    }
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            tls_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            tls_settings.certificate = path;
-                        }
                     }
                     let tls_settings = tls_settings.write_to_bytes().unwrap();
                     tls_outbound.settings = tls_settings;
@@ -934,16 +835,6 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     }
                     if let Some(ext_sni) = &ext_proxy.sni {
                         quic_settings.server_name = ext_sni.clone();
-                    }
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            quic_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            quic_settings.certificate = path;
-                        }
                     }
                     let quic_settings = quic_settings.write_to_bytes().unwrap();
                     quic_outbound.settings = quic_settings;
@@ -1002,164 +893,6 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     }
                     outbounds.push(outbound);
                 }
-                "vmess" => {
-                    // tls
-                    let mut tls_outbound = internal::Outbound::new();
-                    tls_outbound.protocol = "tls".to_string();
-                    let mut tls_settings = internal::TlsOutboundSettings::new();
-                    if let Some(ext_sni) = &ext_proxy.sni {
-                        tls_settings.server_name = ext_sni.clone();
-                    }
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            tls_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            tls_settings.certificate = path;
-                        }
-                    }
-                    let tls_settings = tls_settings.write_to_bytes().unwrap();
-                    tls_outbound.settings = tls_settings;
-                    tls_outbound.tag = format!("{}_tls_xxx", ext_proxy.tag.clone());
-
-                    // ws
-                    let mut ws_outbound = internal::Outbound::new();
-                    ws_outbound.protocol = "ws".to_string();
-                    let mut ws_settings = internal::WebSocketOutboundSettings::new();
-                    if let Some(ext_ws_path) = &ext_proxy.ws_path {
-                        ws_settings.path = ext_ws_path.clone();
-                    } else {
-                        ws_settings.path = "/".to_string();
-                    }
-                    if let Some(ext_ws_host) = &ext_proxy.ws_host {
-                        let mut headers = HashMap::new();
-                        headers.insert("Host".to_string(), ext_ws_host.clone());
-                        ws_settings.headers = headers;
-                    }
-                    let ws_settings = ws_settings.write_to_bytes().unwrap();
-                    ws_outbound.settings = ws_settings;
-                    ws_outbound.tag = format!("{}_ws_xxx", ext_proxy.tag.clone());
-
-                    // amux
-                    let mut amux_outbound = internal::Outbound::new();
-                    amux_outbound.tag = ext_proxy.tag.clone();
-                    let mut amux_settings = internal::AMuxOutboundSettings::new();
-                    // always enable tls for trojan
-                    amux_settings.actors.push(tls_outbound.tag.clone());
-                    if ext_proxy.ws.unwrap() {
-                        amux_settings.actors.push(ws_outbound.tag.clone());
-                    }
-                    if let Some(ext_address) = &ext_proxy.address {
-                        amux_settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        amux_settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_max_accepts) = &ext_proxy.amux_max {
-                        amux_settings.max_accepts = *ext_max_accepts as u32;
-                    }
-                    if let Some(ext_concurrency) = &ext_proxy.amux_con {
-                        amux_settings.concurrency = *ext_concurrency as u32;
-                    }
-                    let amux_settings = amux_settings.write_to_bytes().unwrap();
-                    amux_outbound.settings = amux_settings;
-                    amux_outbound.protocol = "amux".to_string();
-                    amux_outbound.tag = format!("{}_amux_xxx", ext_proxy.tag.clone());
-                    // quic
-                    let mut quic_outbound = internal::Outbound::new();
-                    quic_outbound.tag = ext_proxy.tag.clone();
-                    let mut quic_settings = internal::QuicOutboundSettings::new();
-                    if let Some(ext_address) = &ext_proxy.address {
-                        quic_settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        quic_settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_sni) = &ext_proxy.sni {
-                        quic_settings.server_name = ext_sni.clone();
-                    }
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            quic_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            quic_settings.certificate = path;
-                        }
-                    }
-                    let quic_settings = quic_settings.write_to_bytes().unwrap();
-                    quic_outbound.settings = quic_settings;
-                    quic_outbound.protocol = "quic".to_string();
-                    quic_outbound.tag = format!("{}_quic_xxx", ext_proxy.tag.clone());
-
-                    // plain vmess
-                    let mut settings = internal::VMessOutboundSettings::new();
-                    if !ext_proxy.amux.unwrap() {
-                        if let Some(ext_address) = &ext_proxy.address {
-                            settings.address = ext_address.clone();
-                        }
-                        if let Some(ext_port) = &ext_proxy.port {
-                            settings.port = *ext_port as u32;
-                        }
-                    }
-                    if let Some(ext_username) = &ext_proxy.username {
-                        settings.uuid = ext_username.clone();
-                    }
-                    if let Some(ext_encrypt_method) = &ext_proxy.encrypt_method {
-                        settings.security = ext_encrypt_method.clone();
-                    } else {
-                        settings.security = "chacha20-ietf-poly1305".to_string();
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbound.tag = format!("{}_vmess_xxx", ext_proxy.tag.clone());
-
-                    // chain
-                    let mut chain_outbound = internal::Outbound::new();
-                    chain_outbound.tag = ext_proxy.tag.clone();
-                    let mut chain_settings = internal::ChainOutboundSettings::new();
-                    if ext_proxy.amux.unwrap() {
-                        chain_settings.actors.push(amux_outbound.tag.clone());
-                    } else if ext_proxy.quic.unwrap() {
-                        chain_settings.actors.push(quic_outbound.tag.clone());
-                    } else {
-                        if ext_proxy.tls.unwrap() {
-                            chain_settings.actors.push(tls_outbound.tag.clone());
-                        }
-                        if ext_proxy.ws.unwrap() {
-                            chain_settings.actors.push(ws_outbound.tag.clone());
-                        }
-                    }
-
-                    if !chain_settings.actors.is_empty() {
-                        chain_settings.actors.push(outbound.tag.clone());
-                        let chain_settings = chain_settings.write_to_bytes().unwrap();
-                        chain_outbound.settings = chain_settings;
-                        chain_outbound.protocol = "chain".to_string();
-
-                        // always push chain first, in case there isn't final rule,
-                        // the chain outbound will be the default one to use
-                        outbounds.push(chain_outbound);
-                        if ext_proxy.amux.unwrap() {
-                            outbounds.push(amux_outbound);
-                        }
-                        if ext_proxy.quic.unwrap() {
-                            outbounds.push(quic_outbound);
-                        } else if ext_proxy.tls.unwrap() {
-                            outbounds.push(tls_outbound);
-                        }
-                        if ext_proxy.ws.unwrap() {
-                            outbounds.push(ws_outbound);
-                        }
-                        outbounds.push(outbound);
-                    } else {
-                        outbound.tag = ext_proxy.tag.clone();
-                        outbounds.push(outbound);
-                    }
-                }
                 _ => {}
             }
         }
@@ -1171,17 +904,6 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
             outbound.protocol = ext_proxy_group.protocol.clone();
             outbound.tag = ext_proxy_group.tag.clone();
             match outbound.protocol.as_str() {
-                "chain" => {
-                    let mut settings = internal::ChainOutboundSettings::new();
-                    if let Some(ext_actors) = &ext_proxy_group.actors {
-                        for ext_actor in ext_actors {
-                            settings.actors.push(ext_actor.to_string());
-                        }
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
-                }
                 "tryall" => {
                     let mut settings = internal::TryAllOutboundSettings::new();
                     if let Some(ext_actors) = &ext_proxy_group.actors {
@@ -1198,17 +920,23 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     outbound.settings = settings;
                     outbounds.push(outbound);
                 }
-                "static" => {
-                    let mut settings = internal::StaticOutboundSettings::new();
+                "random" => {
+                    let mut settings = internal::RandomOutboundSettings::new();
                     if let Some(ext_actors) = &ext_proxy_group.actors {
                         for ext_actor in ext_actors {
                             settings.actors.push(ext_actor.to_string());
                         }
                     }
-                    if let Some(ext_method) = &ext_proxy_group.method {
-                        settings.method = ext_method.clone();
-                    } else {
-                        settings.method = "random".to_string();
+                    let settings = settings.write_to_bytes().unwrap();
+                    outbound.settings = settings;
+                    outbounds.push(outbound);
+                }
+                "rr" => {
+                    let mut settings = internal::RROutboundSettings::new();
+                    if let Some(ext_actors) = &ext_proxy_group.actors {
+                        for ext_actor in ext_actors {
+                            settings.actors.push(ext_actor.to_string());
+                        }
                     }
                     let settings = settings.write_to_bytes().unwrap();
                     outbound.settings = settings;
@@ -1234,7 +962,7 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     if let Some(ext_check_interval) = ext_proxy_group.check_interval {
                         settings.check_interval = ext_check_interval as u32;
                     } else {
-                        settings.check_interval = 5 * 60; // 5mins
+                        settings.check_interval = 300;
                     }
                     if let Some(ext_failover) = ext_proxy_group.failover {
                         settings.failover = ext_failover;
@@ -1254,27 +982,23 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     if let Some(ext_cache_timeout) = ext_proxy_group.cache_timeout {
                         settings.cache_timeout = ext_cache_timeout as u32;
                     } else {
-                        settings.cache_timeout = 60; // 60mins
+                        settings.cache_timeout = 60; // in minutes
                     }
-                    if let Some(ext_last_resort) = &ext_proxy_group.last_resort {
-                        settings.last_resort = ext_last_resort.clone();
-                    } else {
-                        settings.last_resort = "".to_string();
+                    let settings = settings.write_to_bytes().unwrap();
+                    outbound.settings = settings;
+                    outbounds.push(outbound);
+                }
+                "retry" => {
+                    let mut settings = internal::RetryOutboundSettings::new();
+                    if let Some(ext_actors) = &ext_proxy_group.actors {
+                        for ext_actor in ext_actors {
+                            settings.actors.push(ext_actor.to_string());
+                        }
                     }
-                    if let Some(ext_health_check_timeout) = ext_proxy_group.health_check_timeout {
-                        settings.health_check_timeout = ext_health_check_timeout as u32;
+                    if let Some(ext_attempts) = ext_proxy_group.attempts {
+                        settings.attempts = ext_attempts as u32;
                     } else {
-                        settings.health_check_timeout = 4; // 4s
-                    }
-                    if let Some(ext_health_check_delay) = ext_proxy_group.health_check_delay {
-                        settings.health_check_delay = ext_health_check_delay as u32;
-                    } else {
-                        settings.health_check_delay = 200; // 200ms
-                    }
-                    if let Some(ext_health_check_active) = ext_proxy_group.health_check_active {
-                        settings.health_check_active = ext_health_check_active as u32;
-                    } else {
-                        settings.health_check_active = 15 * 60; // 15mins
+                        settings.attempts = 2;
                     }
                     let settings = settings.write_to_bytes().unwrap();
                     outbound.settings = settings;
@@ -1297,10 +1021,10 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
     }
 
     let mut int_router = internal::Router::new();
-    let mut rules = Vec::new();
+    let mut rules = protobuf::RepeatedField::new();
     if let Some(ext_rules) = conf.rule.as_mut() {
         for ext_rule in ext_rules.iter_mut() {
-            let mut rule = internal::router::Rule::new();
+            let mut rule = internal::Router_Rule::new();
 
             let target_tag = std::mem::take(&mut ext_rule.target);
             rule.target_tag = target_tag;
@@ -1332,28 +1056,25 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                     rule.ip_cidrs.push(ext_filter);
                 }
                 "DOMAIN" => {
-                    let mut domain = internal::router::rule::Domain::new();
-                    domain.type_ =
-                        protobuf::EnumOrUnknown::new(internal::router::rule::domain::Type::FULL);
+                    let mut domain = internal::Router_Rule_Domain::new();
+                    domain.field_type = internal::Router_Rule_Domain_Type::FULL;
                     domain.value = ext_filter;
                     rule.domains.push(domain);
                 }
                 "DOMAIN-KEYWORD" => {
-                    let mut domain = internal::router::rule::Domain::new();
-                    domain.type_ =
-                        protobuf::EnumOrUnknown::new(internal::router::rule::domain::Type::PLAIN);
+                    let mut domain = internal::Router_Rule_Domain::new();
+                    domain.field_type = internal::Router_Rule_Domain_Type::PLAIN;
                     domain.value = ext_filter;
                     rule.domains.push(domain);
                 }
                 "DOMAIN-SUFFIX" => {
-                    let mut domain = internal::router::rule::Domain::new();
-                    domain.type_ =
-                        protobuf::EnumOrUnknown::new(internal::router::rule::domain::Type::DOMAIN);
+                    let mut domain = internal::Router_Rule_Domain::new();
+                    domain.field_type = internal::Router_Rule_Domain_Type::DOMAIN;
                     domain.value = ext_filter;
                     rule.domains.push(domain);
                 }
                 "GEOIP" => {
-                    let mut mmdb = internal::router::rule::Mmdb::new();
+                    let mut mmdb = internal::Router_Rule_Mmdb::new();
 
                     let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
                     mmdb.file = asset_loc.join("geo.mmdb").to_string_lossy().to_string();
@@ -1369,12 +1090,6 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
                 "PORT-RANGE" => {
                     rule.port_ranges.push(ext_filter);
                 }
-                "NETWORK" => {
-                    rule.networks.push(ext_filter);
-                }
-                "INBOUND-TAG" => {
-                    rule.inbound_tags.push(ext_filter);
-                }
                 _ => {}
             }
             rules.push(rule);
@@ -1386,10 +1101,10 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
             int_router.domain_resolve = ext_domain_resolve;
         }
     }
-    let router = protobuf::MessageField::some(int_router);
+    let router = protobuf::SingularPtrField::some(int_router);
 
     let mut dns = internal::Dns::new();
-    let mut servers = Vec::new();
+    let mut servers = protobuf::RepeatedField::new();
     let mut hosts = HashMap::new();
     if let Some(ext_general) = &conf.general {
         if let Some(ext_dns_servers) = &ext_general.dns_server {
@@ -1401,13 +1116,10 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
             }
         }
     }
-    if dns.servers.is_empty() {
-        dns.servers.push("1.1.1.1".to_string());
-    }
     if let Some(ext_hosts) = &conf.host {
         for (name, static_ips) in ext_hosts.iter() {
-            let mut ips = internal::dns::Ips::new();
-            let mut ip_vals = Vec::new();
+            let mut ips = internal::Dns_Ips::new();
+            let mut ip_vals = protobuf::RepeatedField::new();
             for ip in static_ips {
                 ip_vals.push(ip.to_owned());
             }
@@ -1419,20 +1131,28 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
         dns.hosts = hosts;
     }
 
+    let api = if let Some(ext_general) = &conf.general {
+        if ext_general.api_interface.is_some() && ext_general.api_port.is_some() {
+            let mut api_inner = internal::Api::new();
+            api_inner.address = ext_general.api_interface.as_ref().unwrap().to_string();
+            api_inner.port = ext_general.api_port.unwrap() as u32;
+            protobuf::SingularPtrField::some(api_inner)
+        } else {
+            protobuf::SingularPtrField::none()
+        }
+    } else {
+        protobuf::SingularPtrField::none()
+    };
+
     let mut config = internal::Config::new();
-    config.log = protobuf::MessageField::some(log);
+    config.log = protobuf::SingularPtrField::some(log);
     config.inbounds = inbounds;
     config.outbounds = outbounds;
     config.router = router;
-    config.dns = protobuf::MessageField::some(dns);
+    config.dns = protobuf::SingularPtrField::some(dns);
+    config.api = api;
 
     Ok(config)
-}
-
-pub fn from_string(s: &str) -> Result<internal::Config> {
-    let lines = s.lines().map(|s| Ok(s.to_string())).collect();
-    let mut config = from_lines(lines)?;
-    to_internal(&mut config)
 }
 
 pub fn from_file<P>(path: P) -> Result<internal::Config>

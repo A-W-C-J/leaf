@@ -1,6 +1,6 @@
 mod common;
 
-// app(socks) -> (socks)client(chain(ws+trojan+shadowsocks+ws+trojan)) -> (chain(ws+trojan))server1(direct) -> (shadowsocks)server2(direct) -> (chain(ws+trojan))server3(direct) -> echo
+// app(socks) -> (socks)client(ws+trojan+shadowsocks+ws+trojan) -> (ws+trojan)server1(direct) -> (shadowsocks)server2(direct) -> (ws+trojan)server3(direct) -> echo
 #[cfg(all(
     feature = "outbound-socks",
     feature = "inbound-socks",
@@ -111,9 +111,7 @@ fn test_out_chain_8() {
                 "protocol": "trojan",
                 "tag": "trojan",
                 "settings": {
-                    "passwords": [
-                        "password"
-                    ]
+                    "password": "password"
                 }
             }
         ],
@@ -172,9 +170,7 @@ fn test_out_chain_8() {
                 "protocol": "trojan",
                 "tag": "trojan",
                 "settings": {
-                    "passwords": [
-                        "password"
-                    ]
+                    "password": "password"
                 }
             }
         ],
